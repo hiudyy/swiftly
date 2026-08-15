@@ -49,10 +49,12 @@ const JOBS = {};
 // ---------------------------------------------------------------------------
 JOBS['1:swiftly'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/json', net) };
 JOBS['1:swiftly (undici)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/json', undiciNet) };
-JOBS['1:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => () => new Promise((res, rej) => {
+JOBS['1:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
-    http.get(base + '/json', { agent }, (r) => { r.resume(); r.on('end', res); }).on('error', rej);
-}) };
+    return () => new Promise((res, rej) => {
+        http.get(base + '/json', { agent }, (r) => { r.resume(); r.on('end', res); }).on('error', rej);
+    });
+} };
 JOBS['1:axios'] = { modules: { axios: M.axios, http: M.http }, build: ({ axios, http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
     const a = axios.default || axios;
@@ -78,12 +80,14 @@ JOBS['1:undici'] = { modules: { undici: M.undici }, build: ({ undici }, { base }
 const POST_PAYLOAD = { user: 'alice', roles: ['admin', 'editor'], note: 'x'.repeat(500) };
 JOBS['2:swiftly'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.post(base + '/post', POST_PAYLOAD, net) };
 JOBS['2:swiftly (undici)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.post(base + '/post', POST_PAYLOAD, undiciNet) };
-JOBS['2:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => () => new Promise((res, rej) => {
+JOBS['2:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
-    const req = http.request(base + '/post', { method: 'POST', agent, headers: { 'Content-Type': 'application/json' } }, (r) => { r.resume(); r.on('end', res); });
-    req.on('error', rej);
-    req.end(JSON.stringify(POST_PAYLOAD));
-}) };
+    return () => new Promise((res, rej) => {
+        const req = http.request(base + '/post', { method: 'POST', agent, headers: { 'Content-Type': 'application/json' } }, (r) => { r.resume(); r.on('end', res); });
+        req.on('error', rej);
+        req.end(JSON.stringify(POST_PAYLOAD));
+    });
+} };
 JOBS['2:axios'] = { modules: { axios: M.axios, http: M.http }, build: ({ axios, http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
     const a = axios.default || axios;
@@ -108,14 +112,16 @@ JOBS['2:undici'] = { modules: { undici: M.undici }, build: ({ undici }, { base }
 // ---------------------------------------------------------------------------
 JOBS['3:swiftly'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/gzip', net) };
 JOBS['3:swiftly (undici)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/gzip', undiciNet) };
-JOBS['3:raw + gunzip (ceiling)'] = { modules: { http: M.http, zlib: M.zlib }, build: ({ http, zlib }, { base }) => () => new Promise((res, rej) => {
+JOBS['3:raw + gunzip (ceiling)'] = { modules: { http: M.http, zlib: M.zlib }, build: ({ http, zlib }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
-    http.get(base + '/gzip', { agent }, (r) => {
-        const chunks = [];
-        r.on('data', (c) => chunks.push(c));
-        r.on('end', () => { zlib.gunzipSync(Buffer.concat(chunks)); res(); });
-    }).on('error', rej);
-}) };
+    return () => new Promise((res, rej) => {
+        http.get(base + '/gzip', { agent }, (r) => {
+            const chunks = [];
+            r.on('data', (c) => chunks.push(c));
+            r.on('end', () => { zlib.gunzipSync(Buffer.concat(chunks)); res(); });
+        }).on('error', rej);
+    });
+} };
 JOBS['3:got'] = { modules: { got: M.got }, build: ({ got }, { base }) => {
     const g = got.default || got;
     return () => g(base + '/gzip');
@@ -139,14 +145,16 @@ JOBS['3:ky'] = { modules: { ky: M.ky }, build: ({ ky }, { base }) => {
 // ---------------------------------------------------------------------------
 JOBS['4:swiftly'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/big', net) };
 JOBS['4:swiftly (undici)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/big', undiciNet) };
-JOBS['4:raw + JSON.parse (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => () => new Promise((res, rej) => {
+JOBS['4:raw + JSON.parse (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
-    http.get(base + '/big', { agent }, (r) => {
-        const chunks = [];
-        r.on('data', (c) => chunks.push(c));
-        r.on('end', () => { JSON.parse(Buffer.concat(chunks).toString()); res(); });
-    }).on('error', rej);
-}) };
+    return () => new Promise((res, rej) => {
+        http.get(base + '/big', { agent }, (r) => {
+            const chunks = [];
+            r.on('data', (c) => chunks.push(c));
+            r.on('end', () => { JSON.parse(Buffer.concat(chunks).toString()); res(); });
+        }).on('error', rej);
+    });
+} };
 JOBS['4:axios'] = { modules: { axios: M.axios, http: M.http }, build: ({ axios, http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
     const a = axios.default || axios;
@@ -709,10 +717,12 @@ JOBS['15:axios (keepAlive)'] = { modules: { axios: M.axios, http: M.http }, buil
 // ---------------------------------------------------------------------------
 JOBS['16:swiftly (node:http)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/json', net) };
 JOBS['16:swiftly (undici)'] = { modules: { swiftly: M.swiftly }, build: ({ swiftly }, { base }) => () => swiftly.get(base + '/json', undiciNet) };
-JOBS['16:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => () => new Promise((res, rej) => {
+JOBS['16:raw http (ceiling)'] = { modules: { http: M.http }, build: ({ http }, { base }) => {
     const agent = new http.Agent({ keepAlive: true, maxSockets: 32 });
-    http.get(base + '/json', { agent }, (r) => { r.resume(); r.on('end', res); }).on('error', rej);
-}) };
+    return () => new Promise((res, rej) => {
+        http.get(base + '/json', { agent }, (r) => { r.resume(); r.on('end', res); }).on('error', rej);
+    });
+} };
 JOBS['16:undici (raw)'] = { modules: { undici: M.undici }, build: ({ undici }, { base }) => () => undici.request(base + '/json').then(r => r.body.json()) };
 
 export function getJob(scenario, row) {
