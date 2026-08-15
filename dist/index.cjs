@@ -362,15 +362,17 @@ var CookieJar = class {
     if (!this.cookies.has(cookieDomain)) {
       this.cookies.set(cookieDomain, /* @__PURE__ */ new Map());
     }
-    this.cookies.get(cookieDomain).set(entry.name, {
+    const path = this._normalizePath(entry.path);
+    this.cookies.get(cookieDomain).set(`${entry.name}\0${path}`, {
       value: String(entry.value),
       expires: entry.expires instanceof Date ? entry.expires : entry.expires ? new Date(entry.expires) : null,
       httpOnly: !!entry.httpOnly,
       secure: !!entry.secure,
       sameSite: entry.sameSite || "Lax",
+      _name: entry.name,
       _domain: cookieDomain,
       _hostOnly: hostOnly,
-      _path: this._normalizePath(entry.path)
+      _path: path
     });
     return this;
   }
@@ -399,15 +401,17 @@ var CookieJar = class {
         this.cookies.set(cookieDomain, /* @__PURE__ */ new Map());
       }
       const full = cookie.toLowerCase();
-      this.cookies.get(cookieDomain).set(name, {
+      const path = this._normalizePath(pathAttr);
+      this.cookies.get(cookieDomain).set(`${name}\0${path}`, {
         value,
         expires: this._getExpiryFromCookie(cookie),
         httpOnly: full.includes("httponly"),
         secure: full.includes("secure"),
         sameSite: sameSiteAttr || "Lax",
+        _name: name,
         _domain: cookieDomain,
         _hostOnly: hostOnly,
-        _path: this._normalizePath(pathAttr)
+        _path: path
       });
     } catch (error) {
     }
@@ -424,12 +428,12 @@ var CookieJar = class {
     this._clearExpired();
     const { hostname, protocol, pathname } = this._parseTarget(url);
     const out = [];
-    for (const [domainKey, cookies] of this.cookies) {
-      for (const [name, data] of cookies) {
+    for (const [, cookies] of this.cookies) {
+      for (const [, data] of cookies) {
         if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
         if (!this._pathMatches(pathname, data._path)) continue;
         if (data.secure && protocol !== "https:") continue;
-        out.push(`${name}=${data.value}`);
+        out.push(`${data._name}=${data.value}`);
       }
     }
     return out.join("; ");
@@ -444,11 +448,11 @@ var CookieJar = class {
     this._clearExpired();
     const { hostname, pathname } = this._parseTarget(url);
     const out = [];
-    for (const [domainKey, cookies] of this.cookies) {
-      for (const [name, data] of cookies) {
+    for (const [, cookies] of this.cookies) {
+      for (const [, data] of cookies) {
         if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
         if (!this._pathMatches(pathname, data._path)) continue;
-        out.push({ name, ...data });
+        out.push({ name: data._name, ...data });
       }
     }
     return out;
@@ -473,8 +477,8 @@ var CookieJar = class {
   toJSON() {
     const out = {};
     for (const [domain, cookies] of this.cookies.entries()) {
-      out[domain] = Array.from(cookies.entries()).map(([name, data]) => ({
-        name,
+      out[domain] = Array.from(cookies.entries()).map(([, data]) => ({
+        name: data._name,
         value: data.value,
         expires: data.expires ? data.expires.toISOString() : null,
         httpOnly: data.httpOnly,
@@ -1946,7 +1950,7 @@ var HTTPClient = class _HTTPClient {
   // Validação de parâmetros
   _validateRequestParams(method, url, data = null, config = {}) {
     if (typeof method === "string" && VALID_METHODS[method] && typeof url === "string" && url.charCodeAt(0) === 104 && // 'h' — http(s):// absolute URL
-    (data === null || typeof data === "object" || typeof data === "string") && (config === void 0 || config === null || typeof config === "object") && !(config && config.headers)) {
+    url.includes("://") && (data === null || typeof data === "object" || typeof data === "string") && (config === void 0 || config === null || typeof config === "object") && !(config && config.headers)) {
       return;
     }
     const errors = [];
@@ -2020,7 +2024,7 @@ var HTTPClient = class _HTTPClient {
       }
       return urlObj.toString();
     } catch (error) {
-      throw new Error(`Invalid URL: ${url}`);
+      throw new ValidationError(`Invalid URL: ${url}`, { url });
     }
   }
   // Compute an auth identity string used to vary the cache AND dedup keys,
@@ -2029,9 +2033,17 @@ var HTTPClient = class _HTTPClient {
   // auth helpers, an explicit Authorization header and a per-request Cookie
   // header (jar cookies are client-global, so they cannot vary per request).
   _authVary(config) {
+    const headers = config.headers || {};
+    const headerOf = (name) => {
+      const lower = name.toLowerCase();
+      for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() === lower) return value;
+      }
+      return void 0;
+    };
     const parts = [
-      config.headers && config.headers["Authorization"],
-      config.headers && config.headers["Cookie"],
+      headerOf("Authorization"),
+      headerOf("Cookie"),
       config.auth && config.auth.username,
       config.auth && config.auth.password,
       config.bearer,
@@ -2340,7 +2352,8 @@ var HTTPClient = class _HTTPClient {
     if (cookies) {
       options.headers["Cookie"] = cookies;
     }
-    if (!options.headers["Authorization"]) {
+    const hasAuthHeader = Object.keys(options.headers).some((key) => key.toLowerCase() === "authorization");
+    if (!hasAuthHeader) {
       if (config.auth && config.auth.username !== void 0) {
         options.headers["Authorization"] = "Basic " + Buffer.from(`${config.auth.username}:${config.auth.password || ""}`).toString("base64");
       } else if (config.bearer) {
@@ -2357,7 +2370,7 @@ var HTTPClient = class _HTTPClient {
       options.headers["Content-Type"] = "application/json";
     }
     if (data && typeof data === "object" && !Buffer.isBuffer(data) && !(data instanceof import_node_stream.Readable) && !options.headers["Content-Encoding"]) {
-      const compressedData = await this._compressData(data);
+      const compressedData = await this._compressData(data, config);
       data = compressedData.data;
       options.headers["Content-Encoding"] = compressedData.encoding;
     }
@@ -2374,6 +2387,8 @@ var HTTPClient = class _HTTPClient {
     }
     let attempt = 0;
     let redirectCount = config.redirectCount || 0;
+    let recoveredResponse = null;
+    let errorChainHandled = false;
     let circuitBreaker = null;
     if (config.circuitBreaker && config.circuitBreaker.enabled) {
       circuitBreaker = this.circuitBreakers.get(urlObj.hostname);
@@ -2399,7 +2414,13 @@ var HTTPClient = class _HTTPClient {
     const performRequest = useUndici ? () => this._undiciRequest(urlObj, finalOptions, data) : useHttp2 ? () => this._makeHttp2Request(urlObj, finalOptions, data) : () => this._makeRequest(urlObj.protocol, finalOptions, data);
     while (attempt < config.retries) {
       try {
-        const response = circuitBreaker ? await circuitBreaker.execute(performRequest, urlObj.hostname) : await performRequest();
+        let response;
+        if (recoveredResponse) {
+          response = recoveredResponse;
+          recoveredResponse = null;
+        } else {
+          response = circuitBreaker ? await circuitBreaker.execute(performRequest, urlObj.hostname) : await performRequest();
+        }
         if (useHttp2) this.metrics.http2Requests++;
         if (circuitBreaker && response.status >= 500) {
           circuitBreaker.handleFailure(urlObj.hostname);
@@ -2505,6 +2526,18 @@ var HTTPClient = class _HTTPClient {
             }
           }
           throw error;
+        }
+        if (!errorChainHandled && this.interceptors.response.handlers.length > 0) {
+          errorChainHandled = true;
+          try {
+            const recovered = await this.interceptors.response.executeResponseErrorChain(error);
+            if (recovered !== void 0) {
+              recoveredResponse = recovered;
+              continue;
+            }
+          } catch (interceptorError) {
+            error = interceptorError;
+          }
         }
         const status = ((_a = error.response) == null ? void 0 : _a.status) || ((_c = (_b = error.context) == null ? void 0 : _b.response) == null ? void 0 : _c.status);
         let shouldRetry;
@@ -2800,6 +2833,15 @@ var HTTPClient = class _HTTPClient {
     }
     const payload = Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data);
     const bytes = Buffer.byteLength(payload);
+    const maxBodyLength = config.maxBodyLength;
+    if (typeof maxBodyLength === "number" && maxBodyLength !== Infinity && bytes > maxBodyLength) {
+      req.destroy(new RequestError("Request body exceeds maxBodyLength", {
+        options: { config },
+        maxBodyLength,
+        length: bytes
+      }));
+      return;
+    }
     req.write(payload, () => {
       const progress = { loaded: bytes, total: bytes, percent: 100 };
       if (config.onUploadProgress) config.onUploadProgress(progress);
@@ -2867,6 +2909,15 @@ var HTTPClient = class _HTTPClient {
     const hasProgress = totalBytes > 0 && (requestCfg.onDownloadProgress || this.events.hasListeners(events.PROGRESS) || this.events.hasListeners(events.DOWNLOAD_PROGRESS));
     stream.on("data", (chunk) => {
       receivedBytes += chunk.length;
+      if (requestCfg.maxContentLength !== Infinity && receivedBytes > requestCfg.maxContentLength) {
+        stream.destroy();
+        reject(new RequestError("Response exceeds maxContentLength", {
+          options,
+          maxContentLength: requestCfg.maxContentLength,
+          received: receivedBytes
+        }));
+        return;
+      }
       if (prealloc) {
         if (writeOffset === 0 && receivedBytes === contentLength) {
           prealloc = chunk;
@@ -2936,6 +2987,11 @@ var HTTPClient = class _HTTPClient {
       });
       this._attachSignal(req, options);
       this._setupTimeouts(req, options);
+      if (typeof options.timeout === "number") {
+        req.once("timeout", () => {
+          req.destroy(new TimeoutError("Request timed out", "socket"));
+        });
+      }
       req.on("error", (error) => {
         reject(this._enhanceError(error, options, protocol));
       });
@@ -2981,6 +3037,9 @@ var HTTPClient = class _HTTPClient {
           }, handler);
           this._attachSignal(req, options);
           this._setupTimeouts(req, options);
+          if (typeof options.timeout === "number") {
+            req.once("timeout", () => req.destroy(new TimeoutError("Request timed out", "socket")));
+          }
           req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
           this._sendPayload(req, data, options.config || {});
         });
@@ -3002,6 +3061,9 @@ var HTTPClient = class _HTTPClient {
         }, handler);
         this._attachSignal(req, options);
         this._setupTimeouts(req, options);
+        if (typeof options.timeout === "number") {
+          req.once("timeout", () => req.destroy(new TimeoutError("Request timed out", "socket")));
+        }
         req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
         this._sendPayload(req, data, options.config || {});
       }
@@ -3053,17 +3115,18 @@ var HTTPClient = class _HTTPClient {
       throw error;
     }
   }
-  async _compressData(data) {
+  async _compressData(data, config = this.config) {
     let jsonStr;
     try {
       jsonStr = JSON.stringify(data);
     } catch (error) {
       throw new ValidationError(`Cannot serialize data: ${error.message}`, { data: typeof data });
     }
-    if (!this.config.compression.request) {
+    const compression = config.compression || this.config.compression;
+    if (!compression.request) {
       return { data: jsonStr, encoding: "identity" };
     }
-    if (jsonStr.length < this.config.compression.minSize) {
+    if (jsonStr.length < compression.minSize) {
       return { data: jsonStr, encoding: "identity" };
     }
     return new Promise((resolve, reject) => {
@@ -3498,11 +3561,14 @@ function extractForms(html) {
   return parseHTML(html, "form").map((f) => ({
     action: f.attr("action"),
     method: (f.attr("method") || "get").toLowerCase(),
-    fields: f.find("input, select, textarea, button").map((el) => ({
-      name: el.attr("name"),
-      type: el.tag === "input" ? el.attr("type") || "text" : el.tag,
-      value: el.tag === "textarea" ? el.content : el.attr("value")
-    })).filter((x) => x.name)
+    fields: f.find("input, select, textarea, button").map((el) => {
+      var _a, _b;
+      return {
+        name: el.attr("name"),
+        type: el.tag === "input" ? el.attr("type") || "text" : el.tag,
+        value: el.tag === "textarea" ? el.content : el.tag === "select" ? ((_a = el.find("option[selected]")[0]) == null ? void 0 : _a.attr("value")) ?? ((_b = el.find("option")[0]) == null ? void 0 : _b.attr("value")) ?? null : el.attr("value")
+      };
+    }).filter((x) => x.name)
   }));
 }
 function extractJsonLd(html) {
@@ -3640,12 +3706,12 @@ function htmlToMarkdown(html) {
 `);
   md = md.replace(/<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, "**$1**");
   md = md.replace(/<(?:em|i)[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, "*$1*");
-  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
   md = md.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, t) => `
 \`\`\`
-${t.trim()}
+${t.replace(/<[^>]+>/g, "").trim()}
 \`\`\`
 `);
+  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
   md = md.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
   md = md.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, t) => `- ${t.trim()}
 `);

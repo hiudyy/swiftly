@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createClient } from '../lib/client.js';
+import { createCookieJar } from '../lib/interceptor.js';
 import swiftly from '../index.mjs';
 import { startStoreServer } from './helpers/store-server.js';
 import { parseHTML } from '../lib/scraper.js';
@@ -715,6 +716,10 @@ describe('user journey: typed errors and validation', () => {
         await expect(api.get('relative/without/base')).rejects.toMatchObject({
             code: 'VALIDATION_ERROR'
         });
+        // 'h'-prefixed strings are not URLs: they must fail with a typed
+        // error, not a raw TypeError (regression: fast-path validation)
+        await expect(api.get('hello')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+        await expect(api.get('http//x.com')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
     });
 });
 
@@ -746,5 +751,122 @@ describe('user journey: public API surface', () => {
         expect(typeof shared.interceptors.request.use).toBe('function');
         const v = await swiftly.get(`${srv.url}/api/version`);
         expect(v.version).toBe('2.4.1');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// 🩺 Deep-dive regressions found while probing more of the library
+// ---------------------------------------------------------------------------
+describe('deep-dive regressions', () => {
+    it('runs response error interceptors and can recover the request', async () => {
+        const api = createClient({ cache: { enabled: false }, retries: 1 });
+        const seen = [];
+        api.interceptors.response.use(
+            (res) => res,
+            (err) => {
+                seen.push(err.response?.status);
+                if (err.response && err.response.status === 401) {
+                    // simulate a token refresh: recover with a 200 envelope
+                    return {
+                        data: Buffer.from(JSON.stringify({ recovered: true, from: 'interceptor' })),
+                        status: 200,
+                        headers: { 'content-type': 'application/json' }
+                    };
+                }
+                throw err;
+            }
+        );
+        const result = await api.get(`${srv.url}/api/me`); // 401 without a session
+        expect(result).toEqual({ recovered: true, from: 'interceptor' });
+        expect(seen).toEqual([401]);
+    });
+
+    it('still propagates errors when the response error interceptor rethrows', async () => {
+        const api = createClient({ cache: { enabled: false }, retries: 1 });
+        const seen = [];
+        api.interceptors.response.use(
+            (res) => res,
+            (err) => { seen.push(err.code); throw err; }
+        );
+        await expect(api.get(`${srv.url}/api/error/500`))
+            .rejects.toMatchObject({ code: 'RESPONSE_ERROR' });
+        expect(seen).toEqual(['RESPONSE_ERROR']);
+    });
+
+    it('does not leak cached responses between a lowercase-auth request and an anonymous one', async () => {
+        const api = createClient({ cache: { enabled: true, ttl: 60000 }, retries: 1 });
+        const { token } = await api.post(`${srv.url}/api/token`, { email: 'alice@swiftly.dev', password: 'secret' });
+        const authed = await api.get(`${srv.url}/api/tenant`, { headers: { authorization: `Bearer ${token}` } });
+        expect(authed.tenant).toBe('alice@swiftly.dev');
+        // anonymous request must NOT be served the authenticated cached body
+        await expect(api.get(`${srv.url}/api/tenant`))
+            .rejects.toMatchObject({ code: 'RESPONSE_ERROR', response: { status: 401 } });
+        expect(srv.getHits('/api/tenant')).toBe(2);
+    });
+
+    it('honors per-request compression.request=false (no gzip upload)', async () => {
+        const api = createClient({ cache: { enabled: false } });
+        const big = { payload: 'z'.repeat(3000) };
+        const gzipped = await api.post(`${srv.url}/api/echo`, big);
+        expect(gzipped.contentEncoding).toBe('gzip');
+        const plain = await api.post(`${srv.url}/api/echo`, big, { compression: { request: false } });
+        expect(['identity', null]).toContain(plain.contentEncoding);
+        expect(plain.body.payload).toBe(big.payload);
+    });
+
+    it('enforces the timeout option and aborts slow requests', async () => {
+        const api = createClient({ cache: { enabled: false }, retries: 1, timeout: 250 });
+        const start = Date.now();
+        await expect(api.get(`${srv.url}/api/slow?ms=3000`))
+            .rejects.toMatchObject({ code: 'TIMEOUT_ERROR' });
+        expect(Date.now() - start).toBeLessThan(1500);
+    });
+
+    it('enforces maxContentLength on downloads', async () => {
+        const api = createClient({ cache: { enabled: false }, retries: 1, maxContentLength: 1024 });
+        await expect(api.download(`${srv.url}/files/photo.png`))
+            .rejects.toMatchObject({ code: 'REQUEST_ERROR' });
+    });
+
+    it('enforces maxBodyLength on uploads', async () => {
+        const api = createClient({ cache: { enabled: false }, retries: 1, maxBodyLength: 10 });
+        await expect(api.post(`${srv.url}/api/echo`, { payload: 'x'.repeat(500) }))
+            .rejects.toMatchObject({ code: 'REQUEST_ERROR' });
+    });
+
+    it('keeps cookies with the same name but different Paths separate', () => {
+        const jar = createCookieJar();
+        jar.setCookie('https://shop.test', 'sid=root; Path=/; HttpOnly');
+        jar.setCookie('https://shop.test', 'sid=admin; Path=/admin');
+        // RFC 6265: a Path=/ cookie also matches /admin, so BOTH are sent
+        expect(jar.getCookies('https://shop.test/')).toBe('sid=root');
+        expect(jar.getCookies('https://shop.test/admin')).toBe('sid=root; sid=admin');
+        expect(jar.getCookies('https://shop.test/admin/settings')).toBe('sid=root; sid=admin');
+        // a different path does NOT see the admin-only cookie
+        expect(jar.getCookies('https://shop.test/products')).toBe('sid=root');
+        // overwriting the same (name, path) still replaces the value in place
+        jar.setCookie('https://shop.test', 'sid=root2; Path=/');
+        expect(jar.getCookies('https://shop.test/')).toBe('sid=root2');
+        expect(jar.getCookies('https://shop.test/admin')).toBe('sid=root2; sid=admin');
+    });
+
+    it('renders <pre><code> blocks as fenced code without inner backticks', () => {
+        const md = htmlToMarkdown('<pre><code>const a = 1;\nconsole.log(a);</code></pre>');
+        expect(md).toContain('```');
+        expect(md).toContain('const a = 1;');
+        expect(md).not.toContain('`const a');
+    });
+
+    it('extracts the selected option value from <select> fields', async () => {
+        const { extractForms } = await import('../lib/extract.js');
+        const html = '<form action="/submit">' +
+            '<input name="user" value="ada">' +
+            '<select name="role"><option value="admin">Admin</option><option value="staff">Staff</option></select>' +
+            '<select name="region"><option>EU</option><option value="us" selected>US</option></select>' +
+            '</form>';
+        const fields = extractForms(html)[0].fields;
+        expect(fields.find((f) => f.name === 'role').value).toBe('admin');
+        expect(fields.find((f) => f.name === 'region').value).toBe('us');
+        expect(fields.find((f) => f.name === 'user').value).toBe('ada');
     });
 });
