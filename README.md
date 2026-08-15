@@ -33,9 +33,7 @@ npm install swiftly
 
 Requires Node.js **>= 14.13**.
 
-## Quick start
-
-**ESM**
+## ESM
 
 ```js
 import swiftly from 'swiftly';
@@ -45,21 +43,25 @@ const items = await swiftly.get('https://api.example.com/items', {
 });
 ```
 
-**CommonJS**
+## CommonJS
+
+`require('swiftly')` returns the same client function (with `.default` also
+set), so everything below works identically:
 
 ```js
 const swiftly = require('swiftly');
+
+swiftly.get('https://api.example.com/items', { params: { page: 1 } })
+  .then((items) => console.log(items));
 ```
 
-**Creating a client**
+## Creating a client
 
 Pass a config object to get a client with its own defaults and shared state
 (connection pool, cookie jar, cache, circuit breakers). Relative URLs resolve
-against `baseURL`.
+against `baseURL`:
 
 ```js
-import swiftly from 'swiftly';
-
 const api = swiftly({
   baseURL: 'https://api.example.com',
   headers: { 'X-App': 'demo' },
@@ -71,101 +73,74 @@ const api = swiftly({
 const item = await api.get('/items/42'); // GET https://api.example.com/items/42
 ```
 
-Both the default export and client instances are equivalent — static calls
-(`swiftly.get`, `swiftly.post`, …) reuse one internal client, so state persists
+Both styles are the same client underneath — static calls
+(`swiftly.get`, `swiftly.post`, …) share one internal client, so state persists
 across calls.
 
-## Configuration
-
-`swiftly(config)` accepts the options below (all optional; defaults are
-performance-first — no timeout, no rate limiting, caching on). Every group is
-shown; for per-option detail see
-[Configuration](https://github.com/hiudyy/swiftly/blob/master/docs/configuration.md).
-
-| Group | Option | Default | Description |
-| ----- | ------ | ------- | ----------- |
-| Networking | `baseURL` | `null` | Prefix applied to relative URLs. |
-| | `timeout` | `null` | Per-request socket timeout (ms); opt-in. |
-| | `timeouts` | `null` | `{ connect, response, idle }` timers (ms). |
-| | `followRedirects` | `true` | Follow 3xx responses. |
-| | `maxRedirects` | `5` | Max redirects to follow. |
-| | `validateSSL` | `true` | Reject invalid TLS certificates. |
-| | `useHttp2` | `false` | Use HTTP/2 when available. |
-| | `transport` | `'http'` | `'http'` or `'undici'` (optional peer dependency). |
-| | `proxy` | `null` | `{ host, port, auth? }` HTTP(S) proxy. |
-| | `decompress` | `true` | Auto gzip/deflate/br. |
-| Retries | `retries` | `3` | Total attempts (1 = no retry). |
-| | `retryDelay` | `1000` | Base delay between attempts (ms). |
-| | `retryBackoff` | `null` | Exponential factor (≥1); linear when `null`. |
-| | `retryJitter` | `false` | Randomize backoff. |
-| | `retryOn` | `null` | `number[]` of status codes or `(err) => boolean`. |
-| | `maxRetryAfter` | `60000` | Cap (ms) for an honored `Retry-After`. |
-| | `onRetry` | `null` | `(attempt, error, delay) => void`. |
-| Performance | `keepAlive` | `true` | Reuse TCP connections (pooling). |
-| | `maxSockets` | `Infinity` | Max concurrent sockets per origin. |
-| | `maxFreeSockets` | `256` | Idle sockets kept alive. |
-| | `agent` | `null` | Custom `http.Agent` override. |
-| | `humanize` | `false` | Artificial delay between requests. |
-| | `compression` | `{ request: true, response: true, minSize: 1024, responseMinSize: 0 }` | Compression handling. |
-| | `session` | `{ ttl: 3600000, maxSessions: 100, autoCleanup: true }` | HTTP/2 session pool. |
-| Caching | `cache.enabled` | `true` | Cache GET responses. |
-| | `cache.ttl` | `300000` | Entry lifetime (ms). |
-| | `cache.maxSize` | `1000` | Max entries (LRU eviction). |
-| | `cache.staleWhileRevalidate` | `false` | Serve stale while refreshing. |
-| | `cache.keyBuilder` | `null` | Custom `(method, url, data) => string`. |
-| Resilience | `circuitBreaker.enabled` | `false` | Enable per-domain breaker. |
-| | `circuitBreaker.failureThreshold` | `5` | Failures before it opens. |
-| | `circuitBreaker.resetTimeout` | `60000` | Cool-down before recovery (ms). |
-| | `rateLimiting.enabled` | `false` | Enable per-domain throttling. |
-| | `rateLimiting.requestsPerSecond` | `2` | Target rate per domain. |
-| | `rateLimiting.minDelay` / `maxDelay` | `1000` / `64000` | Backoff bounds (ms). |
-| Requests | `params` | – | Query params (nested objects/arrays serialized). |
-| | `headers` | – | Request headers. |
-| | `auth` | `null` | `{ username, password }` → Basic. |
-| | `bearer` | `null` | `Bearer <token>`. |
-| | `token` | `null` | Raw `Authorization`. |
-| | `responseType` | `'json'` | `'json' \| 'text' \| 'buffer' \| 'stream' \| 'raw'`. |
-| | `responseSchema` | `null` | Validate/transform body (throws `ValidationError`). |
-| | `stream` | `false` | Return raw response stream. |
-| | `maxContentLength` / `maxBodyLength` | `Infinity` | Size guards. |
-| | `randomizeHeaders` | `false` | Randomize header ordering. |
-| | `debug` | `false` | Verbose logging. |
-| Hooks | `onRequest` | `null` | `(config) => void`. |
-| | `onResponse` | `null` | `(response) => void`. |
-| | `onError` | `null` | `(error) => void`. |
-| | `onDownloadProgress` | `null` | `({ loaded, total }) => void`. |
-| | `onUploadProgress` | `null` | `({ loaded, total }) => void`. |
-
-## Request methods
-
-| Method | Signature |
-| ------ | --------- |
-| `get` / `delete` / `head` / `options` | `get(url, config?)` |
-| `post` / `put` / `patch` | `post(url, data?, config?)` |
-| `query` (GraphQL) | `query(url, { query, variables }, config?)` |
-| `subscribe` (SSE) | `subscribe(url, { onMessage, onError, onOpen }, config?)` → `unsubscribe()` |
-| `batch` | `batch([{ method, url, data?, config? }])` |
-| `download` | `download(url, config?)` → `Buffer` |
-| `scrape` | `scrape(url, selector, config?)` |
-| `parse` | `parse(html, selectors)` (no request) |
-
-## Return value
-
-Every request resolves with the **parsed response body** — no `{ data }` wrapper.
-
-| Content-Type | Returns |
-| ------------ | ------- |
-| `application/json` | parsed object / array |
-| `text/*`, `html` | `string` |
-| other | `Buffer` |
-
-Force a shape with `responseType`:
+## Making requests
 
 ```js
-await swiftly.get(url, { responseType: 'text' });    // string
-await swiftly.get(url, { responseType: 'buffer' });  // Buffer
-await swiftly.get(url, { responseType: 'raw' });     // { data, status, headers, duration }
-await swiftly.get(url, { responseType: 'stream' });  // Readable stream
+await api.get('/items');                       // GET
+await api.get('/items', { params: { page: 2 } });
+
+await api.post('/items', { name: 'Widget' });  // POST (JSON body)
+await api.put('/items/1', { name: 'Widget+' });   // PUT
+await api.patch('/items/1', { name: 'Widget!' }); // PATCH
+await api.delete('/items/1');                  // DELETE
+await api.head('/items/1');                    // HEAD
+await api.options('/items');                   // OPTIONS
+
+// any verb via the low-level entry point
+await api.request('PURGE', '/cache');
+```
+
+## What requests return
+
+Every request resolves with the **parsed response body** — no `{ data }`
+wrapper to unwrap. The shape follows the response `Content-Type`:
+
+```js
+const json   = await api.get('/user');            // Content-Type: application/json -> object
+const text   = await api.get('/page', { responseType: 'text' });   // string
+const buffer = await api.get('/img.png', { responseType: 'buffer' }); // Buffer
+const raw    = await api.get('/user', { responseType: 'raw' });    // { data, status, headers, duration }
+```
+
+`raw` gives you the full envelope:
+
+```js
+const { data, status, headers, duration } = await api.get('/user', { responseType: 'raw' });
+console.log(status, duration, headers['content-type'], data);
+```
+
+Stream the body (retries are disabled for streams):
+
+```js
+const { Readable } = await api.get('/file', { stream: true });
+for await (const chunk of Readable) process.stdout.write(chunk);
+```
+
+Download to a `Buffer` in one call:
+
+```js
+const buf = await api.download('https://example.com/file.zip');
+```
+
+## Query params & headers
+
+```js
+// Scalars, arrays and nested objects are all serialized safely:
+await api.get('/items', {
+  params: {
+    page: 1,
+    tags: ['a', 'b'],          // ?tags=a&tags=b
+    filter: { active: true },  // ?filter={"active":true}
+  },
+});
+
+// Headers per request, or as client defaults:
+await api.get('/me', { headers: { 'X-Request-Id': 'abc' } });
+api.setDefaultHeaders({ 'X-App': 'demo' });
 ```
 
 ## Auth
@@ -176,93 +151,178 @@ swiftly({ bearer: '<token>' });            // Bearer <token>
 swiftly({ token: '<token>' });             // raw Authorization
 ```
 
+## Configuration in practice
+
+`swiftly(config)` accepts everything below — all optional, defaults are
+performance-first (no timeout, no rate limiting, caching on). Each group is
+shown in real code:
+
+```js
+const api = swiftly({
+  // ----- Networking -----
+  baseURL: 'https://api.example.com',  // prefix for relative URLs
+  timeout: 8000,                       // per-request socket timeout (ms)
+  timeouts: { connect: 2000, response: 5000, idle: 10000 }, // fine-grained timers
+  followRedirects: true,               // follow 3xx automatically
+  maxRedirects: 5,                     // max redirect hops
+  validateSSL: true,                   // reject invalid TLS certs (dev: false)
+  useHttp2: false,                     // try HTTP/2 when available
+  transport: 'http',                   // 'http' | 'undici' (optional peer dep)
+  proxy: { host: '127.0.0.1', port: 8080 }, // HTTP(S) proxy
+  decompress: true,                    // auto gzip/deflate/br
+
+  // ----- Retries -----
+  retries: 3,                          // total attempts (1 = no retry)
+  retryDelay: 500,                     // base delay (ms)
+  retryBackoff: 2,                     // exponential factor (>=1); linear when null
+  retryJitter: true,                   // randomize backoff
+  retryOn: [429, 500, 502, 503, 504],  // status codes that trigger a retry
+  maxRetryAfter: 30000,                // cap for an honored Retry-After (ms)
+  onRetry: (attempt, error, delay) => console.log(`retry ${attempt} in ${delay}ms`),
+
+  // ----- Performance -----
+  keepAlive: true,                     // reuse TCP sockets (pooling)
+  maxSockets: 100,                     // max concurrent sockets per origin
+  maxFreeSockets: 256,                 // idle sockets kept alive
+  agent: null,                         // custom http.Agent override
+  humanize: false,                     // artificial delay between requests
+  compression: { request: true, response: true, minSize: 1024, responseMinSize: 0 },
+  session: { ttl: 3600000, maxSessions: 100, autoCleanup: true }, // HTTP/2 pool
+
+  // ----- Caching (auth-aware keys) -----
+  cache: {
+    enabled: true,                     // cache GET responses
+    ttl: 300_000,                      // entry lifetime (ms)
+    maxSize: 1000,                     // LRU eviction
+    staleWhileRevalidate: false,       // serve stale while refreshing
+  },
+
+  // ----- Resilience -----
+  circuitBreaker: { enabled: true, failureThreshold: 5, resetTimeout: 60000 },
+  rateLimiting: { enabled: true, requestsPerSecond: 20, minDelay: 1000, maxDelay: 64000 },
+
+  // ----- Requests -----
+  params: {},                          // default query params
+  headers: {},                         // default headers
+  auth: null,                          // { username, password } -> Basic
+  bearer: null,                        // -> Authorization: Bearer <token>
+  token: null,                         // -> Authorization: <token>
+  responseType: 'json',                // 'json'|'text'|'buffer'|'stream'|'raw'
+  responseSchema: { id: 'number' },    // type-map validated against the JSON body
+  stream: false,                       // return the raw stream
+  maxContentLength: Infinity,          // size guards
+  maxBodyLength: Infinity,
+  randomizeHeaders: false,             // randomize header ordering
+  debug: false,                        // verbose logging
+
+  // ----- Hooks -----
+  onRequest: (cfg) => console.log('→', cfg.method, cfg.url),
+  onResponse: (res) => console.log('←', res.status),
+  onError: (err) => console.error('!', err.code),
+  onDownloadProgress: ({ loaded, total }) => {},
+  onUploadProgress: ({ loaded, total }) => {},
+});
+```
+
 ## Resilience
 
 ```js
 const api = swiftly({
-  retries: 3,
-  retryDelay: 1000,
-  retryBackoff: 2,        // exponential backoff
+  retries: 4,
+  retryBackoff: 2,
   retryJitter: true,
   retryOn: [429, 500, 502, 503, 504],
   timeout: 8000,
   circuitBreaker: { enabled: true, failureThreshold: 5, resetTimeout: 60000 },
-  rateLimiting: { enabled: true, requestsPerSecond: 10 },
+  rateLimiting: { enabled: true, requestsPerSecond: 20 },
 });
+
+api.on('circuit:open', ({ domain }) => console.warn(`breaker open: ${domain}`));
 ```
 
-- **Retries** — automatic with linear/exponential backoff + optional jitter; honors `Retry-After`.
-- **Circuit breaker** — opens after `failureThreshold` failures and recovers after `resetTimeout` (also trips on 5xx).
-- **Rate limiting** — optional per-domain throttle with adaptive backoff.
-- **Timeouts** — opt-in connect/response/idle timers via `timeouts`.
+- **Retries** — linear or exponential backoff + optional jitter; honors `Retry-After`.
+- **Circuit breaker** — opens after `failureThreshold` failures, recovers after
+  `resetTimeout`, and also trips on 5xx.
+- **Rate limiting** — per-domain throttle with adaptive backoff.
 
 ## Caching
 
 GET responses are cached by default using **auth-aware keys**, so responses for
-different credentials are never shared.
+different credentials are never shared:
 
 ```js
-const api = swiftly({
-  cache: { enabled: true, ttl: 300_000, staleWhileRevalidate: true },
-});
-```
+const api = swiftly({ cache: { enabled: true, ttl: 300_000, staleWhileRevalidate: true } });
 
-## Streaming & downloads
-
-```js
-// Stream the body (retries are disabled for streams)
-const { Readable } = await swiftly.get(url, { stream: true });
-for await (const chunk of Readable) process.stdout.write(chunk);
-
-// Download to a Buffer
-const buf = await swiftly.download('https://example.com/file.zip');
+await api.get('/config');                 // miss -> network
+await api.get('/config');                 // hit  -> instant (possibly stale, refreshed in bg)
+await api.get('/stock?sku=1', { cache: { enabled: false } }); // always fresh
 ```
 
 ## GraphQL
 
 ```js
-const data = await swiftly.query('https://api.example.com/graphql', {
+const data = await api.query('https://api.example.com/graphql', {
   query: `query ($id: ID!) { user(id: $id) { name } }`,
   variables: { id: 1 },
 });
-// data === response.body.data
+// data === response.body.data (throws with .graphqlErrors on server errors)
 ```
 
 ## Server-Sent Events
 
 ```js
-const unsubscribe = await swiftly.subscribe('https://api.example.com/stream', {
+const unsubscribe = await api.subscribe('https://api.example.com/stream', {
+  onOpen: () => console.log('connected'),
   onMessage: (msg) => console.log(msg.data),
   onError: (err) => console.error(err),
 });
-// call unsubscribe() to stop
+
+// later:
+unsubscribe();
 ```
 
 ## Batch
 
+Run many requests concurrently — never rejects, each result is the body or
+`{ error }`:
+
 ```js
-const results = await swiftly.batch([
-  { method: 'GET', url: '/users/1' },
+const results = await api.batch([
+  { method: 'GET',  url: '/users/1' },
   { method: 'POST', url: '/events', data: { type: 'click' } },
 ]);
-// each entry is the parsed body, or { error } on failure
+
+for (const r of results) {
+  if (r.error) console.error('failed', r.error.code);
+  else console.log('ok', r);
+}
 ```
 
 ## Interceptors
 
+Transform requests before they're sent, and responses/errors after:
+
 ```js
-const api = swiftly();
-api.interceptors.request.use((cfg) => {
-  cfg.headers['X-Trace'] = crypto.randomUUID();
-  return cfg;
+api.interceptors.request.use((config) => {
+  config.headers['X-Trace'] = crypto.randomUUID();
+  return config;
 });
-api.interceptors.response.use((res) => res);
+
+api.interceptors.response.use(
+  (res) => res,
+  (error) => {
+    if (error.code === 'RESPONSE_ERROR' && error.response.status === 401) {
+      // e.g. refresh a token and retry
+    }
+    throw error;
+  },
+);
 ```
 
 ## Cookies & sessions
 
 Cookies from `Set-Cookie` are stored per domain and sent back automatically,
-with correct `Domain` (incl. subdomains), `Path` and `Secure` handling.
+with correct `Domain` (incl. subdomains), `Path` and `Secure` handling:
 
 ```js
 const api = swiftly();
@@ -272,7 +332,7 @@ await api.get('https://example.com/dashboard');  // cookie is sent back
 
 ## Web scraping
 
-Swiftly ships a dependency-free HTML parser with CSS-like selectors.
+Swiftly ships a dependency-free HTML parser with CSS-like selectors:
 
 ```js
 import { parseHTML, extractLinks, htmlToMarkdown } from 'swiftly';
@@ -287,39 +347,44 @@ const { titles, links } = parseHTML(html, {
 const md = htmlToMarkdown(html);
 ```
 
-See [Web scraping](https://github.com/hiudyy/swiftly/blob/master/docs/scraping.md)
-for the full selector syntax and the extraction suite (`extractLinks`,
-`extractTables`, `extractJsonLd`, …).
+Fetch + parse in one step:
+
+```js
+const titles = await api.scrape('https://example.com', '.product-title');
+```
+
+See [docs/scraping.md](https://github.com/hiudyy/swiftly/blob/master/docs/scraping.md)
+for the full selector syntax and the extraction suite.
 
 ## Error handling
 
-All errors extend `SwiftlyError` and carry a `code`:
-
-| Error | `code` | When |
-| ----- | ------ | ---- |
-| `ValidationError` | `VALIDATION_ERROR` | bad arguments / URL |
-| `RequestError` | `REQUEST_ERROR` | network failure (DNS, ECONNREFUSED…) |
-| `ResponseError` | `RESPONSE_ERROR` | non-2xx (has `.response`) |
-| `TimeoutError` | `TIMEOUT_ERROR` | timeout exceeded |
-| `CircuitBreakerError` | `CIRCUIT_BREAKER_ERROR` | breaker is open |
+All errors extend `SwiftlyError` and carry a `code` — branch on `code`, never on
+message strings:
 
 ```js
 try {
   await swiftly.get(url);
 } catch (err) {
-  if (err.code === 'RESPONSE_ERROR') console.error(err.response.status);
+  switch (err.code) {
+    case 'RESPONSE_ERROR':   console.error('HTTP', err.response.status, err.response.body); break;
+    case 'REQUEST_ERROR':    console.error('network:', err.cause); break;
+    case 'TIMEOUT_ERROR':    console.error('timed out'); break;
+    case 'CIRCUIT_BREAKER_ERROR': console.error('breaker open:', err.domain); break;
+    default:                 throw err;
+  }
 }
 ```
 
-See [Errors](https://github.com/hiudyy/swiftly/blob/master/docs/errors.md).
+See [docs/errors.md](https://github.com/hiudyy/swiftly/blob/master/docs/errors.md).
 
 ## Events & metrics
 
 ```js
-api.on('request:end', ({ url, status, time }) => {});
+api.on('request:end', ({ url, status, time }) => console.log(status, `${time}ms`, url));
 api.on('circuit:open', ({ domain }) => {});
 
-api.getMetrics(); // { requestCount, cacheHits, cacheMisses, retries, … }
+const m = api.getMetrics();
+console.log(m); // requestCount, cacheHits/Misses, retries, averageResponseTime, ...
 ```
 
 ## CLI
@@ -337,6 +402,7 @@ swiftly scrape https://example.com -s '.main-content'
 - [API reference](https://github.com/hiudyy/swiftly/blob/master/docs/api.md)
 - [Web scraping](https://github.com/hiudyy/swiftly/blob/master/docs/scraping.md)
 - [Errors](https://github.com/hiudyy/swiftly/blob/master/docs/errors.md)
+- [Recipes](https://github.com/hiudyy/swiftly/blob/master/docs/recipes.md)
 
 ## License
 
