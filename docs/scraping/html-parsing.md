@@ -63,10 +63,14 @@ const [paras, links] = parseHTML(html, ['p', 'a']);
 - **Combinators**: descendant (space), child `>`, adjacent sibling `+`,
   general sibling `~`.
 - **Pseudo-classes**:
-  - `:first`, `:first-child`, `:last`, `:last-child`
-  - `:nth-child(expr)` / `:nth-of-type(expr)` — `odd`, `even`, `an+b`
-    (e.g. `2n+1`, `-n+3`), or a plain integer `n`
-  - `:eq(n)` — 0-based index
+  - `:first`, `:last`, `:eq(n)` — **set-relative** (picked from the full
+    match set in document order; `:eq` is 0-based, negative counts from the
+    end) — like jQuery
+  - `:first-child`, `:last-child`, `:only-child` — structural
+  - `:first-of-type`, `:last-of-type`, `:only-of-type` — structural
+  - `:nth-child(expr)` / `:nth-of-type(expr)` / `:nth-last-child(expr)` /
+    `:nth-last-of-type(expr)` — `odd`, `even`, `an+b` (e.g. `2n+1`, `-n+3`),
+    or a plain integer `n`
   - `:contains(text)`
   - `:empty`
   - `:not(sel)`

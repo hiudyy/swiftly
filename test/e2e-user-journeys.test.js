@@ -592,6 +592,21 @@ describe('user journey: redirects', () => {
         expect(raw.status).toBe(302);
         expect(raw.headers.location).toBe('/api/products?page=1&per_page=3');
     });
+
+    it('converts POST to GET on a 303 redirect (no double submit)', async () => {
+        const api = createClient({ cache: { enabled: false } });
+        const res = await api.post(`${srv.url}/api/redirect/303`, { amount: 100 });
+        expect(res.method).toBe('GET');
+        expect(res.query.from).toBe('303');
+    });
+
+    it('preserves method and body on a 307 redirect', async () => {
+        const api = createClient({ cache: { enabled: false } });
+        const res = await api.post(`${srv.url}/api/redirect/307`, { amount: 100 });
+        expect(res.method).toBe('POST');
+        expect(res.query.from).toBe('307');
+        expect(res.body).toEqual({ amount: 100 });
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -868,5 +883,89 @@ describe('deep-dive regressions', () => {
         expect(fields.find((f) => f.name === 'role').value).toBe('admin');
         expect(fields.find((f) => f.name === 'region').value).toBe('us');
         expect(fields.find((f) => f.name === 'user').value).toBe('ada');
+    });
+
+    it('evaluates set-relative pseudos (:first/:last/:eq) over the full match set', () => {
+        const html = '<div>' +
+            '<section class="card"><h2>A</h2><p class="desc">da</p></section>' +
+            '<section class="card"><h2>B</h2><p class="desc">db</p></section>' +
+            '<ul><li>a</li><li>b</li><li>c</li></ul>' +
+            '</div>';
+        expect(parseHTML(html, 'p.desc:first').map((e) => e.content)).toEqual(['da']);
+        expect(parseHTML(html, 'p.desc:last').map((e) => e.content)).toEqual(['db']);
+        expect(parseHTML(html, 'p.desc:eq(0)').map((e) => e.content)).toEqual(['da']);
+        expect(parseHTML(html, 'p.desc:eq(1)').map((e) => e.content)).toEqual(['db']);
+        expect(parseHTML(html, 'ul li:eq(-1)').map((e) => e.content)).toEqual(['c']);
+        expect(parseHTML(html, 'ul li:first').map((e) => e.content)).toEqual(['a']);
+        expect(parseHTML(html, 'ul li:last').map((e) => e.content)).toEqual(['c']);
+    });
+
+    it('supports structural *-of-type / only-* / nth-last-* pseudos', () => {
+        const html = '<div><section class="card"><h2>A</h2></section><section class="card"><h2>B</h2></section><div class="grid"><span>1</span><span>2</span></div></div>';
+        expect(parseHTML(html, 'section:first-of-type')[0].content).toBe('A');
+        expect(parseHTML(html, 'section:last-of-type')[0].content).toBe('B');
+        expect(parseHTML(html, 'h2:only-of-type').length).toBe(2);
+        expect(parseHTML(html, '.grid span:only-child').length).toBe(0);
+        expect(parseHTML(html, '.grid span:nth-last-child(1)')[0].content).toBe('2');
+        expect(parseHTML(html, '.grid span:nth-last-of-type(2)')[0].content).toBe('1');
+    });
+
+    it('renders images, blockquotes, hr and ordered lists in markdown', () => {
+        const md = htmlToMarkdown(
+            '<p>Text <img src="/a.png" alt="A pic"></p>' +
+            '<blockquote><p>quoted <b>text</b></p><p>line two</p></blockquote>' +
+            '<hr>' +
+            '<ol><li>one</li><li>two</li></ol>'
+        );
+        expect(md).toContain('![A pic](/a.png)');
+        expect(md).toContain('> quoted **text**');
+        expect(md).toContain('> line two');
+        expect(md).toContain('---');
+        expect(md).toContain('1. one');
+        expect(md).toContain('2. two');
+    });
+
+    it('does not let tag prefixes corrupt markdown (<b> vs <blockquote>/<body>)', () => {
+        const md = htmlToMarkdown(
+            '<html><body><article><h1>T</h1><p>Hi <b>bold</b></p><blockquote><p>quote</p></blockquote><p><a href="/x">link</a></p></article></body></html>'
+        );
+        expect(md).toContain('Hi **bold**');
+        expect(md).toContain('> quote');
+        expect(md).toContain('[link](/x)');
+        expect(md).not.toContain('<body>');
+    });
+
+    it('resolves relative links against <base href> and honors colspan in tables', async () => {
+        const { extractLinks, extractTables } = await import('../lib/extract.js');
+        const links = extractLinks('<base href="https://site.com/sub/"><a href="page.html">1</a><a href="/root">2</a>');
+        expect(links[0].url).toBe('https://site.com/sub/page.html');
+        expect(links[1].url).toBe('https://site.com/root');
+
+        const tables = extractTables('<table><tr><th>A</th><th>B</th><th>C</th></tr><tr><td>1</td><td colspan="2">2</td></tr></table>');
+        expect(tables[0].headers).toEqual(['A', 'B', 'C']);
+        expect(tables[0].rows[0]).toEqual({ A: '1', B: '2', C: '2' });
+    });
+
+    it('tolerates the JSONPath root prefix and does not misread slices as indexes', async () => {
+        const { queryJSON } = await import('../lib/jsonpath.js');
+        const data = { store: { book: [{ title: 'A', price: 8.95 }, { title: 'B', price: 12.99 }] } };
+        expect(queryJSON(data, '$.store.book[1].title')).toBe('B');
+        expect(queryJSON(data, '$store.book[0].title')).toBe('A');
+        // unsupported slice syntax must not silently become index 0
+        expect(queryJSON(data, 'store.book[0:2].title')).toBeUndefined();
+        expect(queryJSON(data, 'store.book[1,2].title')).toBeUndefined();
+    });
+
+    it('classifies unparseable response bodies as RESPONSE_ERROR, not REQUEST_ERROR', async () => {
+        const http = await import('node:http');
+        const raw = http.createServer((req, res) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{not valid json');
+        });
+        await new Promise((r) => raw.listen(0, '127.0.0.1', r));
+        const base = `http://127.0.0.1:${raw.address().port}`;
+        const api = createClient({ cache: { enabled: false }, retries: 1 });
+        await expect(api.get(base + '/x')).rejects.toMatchObject({ code: 'RESPONSE_ERROR' });
+        await new Promise((r) => raw.close(r));
     });
 });

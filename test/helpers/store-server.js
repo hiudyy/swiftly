@@ -511,6 +511,14 @@ export async function startStoreServer() {
         }
 
         // ---- Redirects -----------------------------------------------------------
+        if (path === '/api/redirect/303') {
+            res.writeHead(303, { Location: '/api/echo?from=303' });
+            return res.end();
+        }
+        if (path === '/api/redirect/307') {
+            res.writeHead(307, { Location: '/api/echo?from=307' });
+            return res.end();
+        }
         const redirectMatch = path.match(/^\/api\/redirect\/(\d+)$/);
         if (redirectMatch) {
             const hops = Number(redirectMatch[1]);

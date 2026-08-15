@@ -1133,7 +1133,7 @@ function parsePseudo(raw) {
   if (name === "not" || name === "has") {
     return { name, arg, groups: compileSelector(arg) };
   }
-  if (name === "nth-child" || name === "nth-of-type") {
+  if (name === "nth-child" || name === "nth-of-type" || name === "nth-last-child" || name === "nth-last-of-type") {
     return { name, arg: parseNth(arg), groups: null };
   }
   if (name === "eq" || name === "contains") {
@@ -1329,17 +1329,29 @@ function matchesCompound(node, simple) {
 function matchesPseudo(node, pseudo) {
   switch (pseudo.name) {
     case "first-child":
-    case "first":
       return node.index === 1;
     case "last-child":
-    case "last":
       return node.parent ? node.index === node.parent.children.length : false;
+    case "first-of-type":
+      return node.typeIndex === 1;
+    case "last-of-type":
+      return typeCount(node, node.tag) === node.typeIndex;
+    case "only-child":
+      return node.parent ? node.parent.children.length === 1 : false;
+    case "only-of-type":
+      return typeCount(node, node.tag) === 1;
     case "nth-child":
       return !!pseudo.arg && nthMatches(node.index, pseudo.arg);
     case "nth-of-type":
       return !!pseudo.arg && nthMatches(node.typeIndex, pseudo.arg);
+    case "nth-last-child":
+      return !!pseudo.arg && node.parent && nthMatches(node.parent.children.length - node.index + 1, pseudo.arg);
+    case "nth-last-of-type":
+      return !!pseudo.arg && nthMatches(typeCount(node, node.tag) - node.typeIndex + 1, pseudo.arg);
     case "eq":
-      return node.index === (Number(pseudo.arg) || 0) + 1;
+    case "first":
+    case "last":
+      return true;
     case "contains":
       return elementText(node).includes(pseudo.arg || "");
     case "empty":
@@ -1351,6 +1363,35 @@ function matchesPseudo(node, pseudo) {
     default:
       return false;
   }
+}
+function typeCount(node, tag) {
+  const parent = node.parent;
+  if (!parent) return 0;
+  let count = 0;
+  for (const sibling of parent.children) {
+    if (sibling.tag === tag) count++;
+  }
+  return count;
+}
+function applyPositional(nodes, simple) {
+  let first = false;
+  let last = false;
+  let eq = null;
+  for (const tok of simple) {
+    if (tok.type !== "pseudo") continue;
+    if (tok.name === "first") first = true;
+    else if (tok.name === "last") last = true;
+    else if (tok.name === "eq") eq = Number(tok.arg) || 0;
+  }
+  if (!first && !last && eq === null) return nodes;
+  if (nodes.length === 0) return nodes;
+  if (eq !== null) {
+    const i = eq < 0 ? nodes.length + eq : eq;
+    return i >= 0 && i < nodes.length ? [nodes[i]] : [];
+  }
+  if (first) return [nodes[0]];
+  if (last) return [nodes[nodes.length - 1]];
+  return nodes;
 }
 function matchesAnyGroup(node, groups) {
   if (!groups) return false;
@@ -1412,7 +1453,7 @@ function queryAllSteps(doc, steps) {
       out.push(n);
     }
   }
-  return out;
+  return applyPositional(out, lastCompound);
 }
 function toElement(node) {
   if (node._el) return node._el;
@@ -1463,14 +1504,28 @@ function toElement(node) {
 }
 function findWithin(node, sel) {
   const groups = compileSelector(sel);
+  const seen = /* @__PURE__ */ new Set();
   const out = [];
-  const stack = [...node.children];
-  while (stack.length) {
-    const n = stack.pop();
-    if (matchesAnyGroup(n, groups)) out.push(n);
-    for (const c of n.children) stack.push(c);
+  for (const steps of groups) {
+    const lastCompound = steps[steps.length - 1].simple;
+    const matches = [];
+    const stack = [...node.children];
+    while (stack.length) {
+      const n = stack.pop();
+      if (matchesCompound(n, lastCompound) && matchLeft(n, steps, steps.length - 2)) {
+        matches.push(n);
+      }
+      for (const c of n.children) stack.push(c);
+    }
+    matches.reverse();
+    for (const n of applyPositional(matches, lastCompound)) {
+      if (!seen.has(n)) {
+        seen.add(n);
+        out.push(n);
+      }
+    }
   }
-  return out.reverse().map(toElement);
+  return out.map(toElement);
 }
 function closestWithin(node, sel) {
   const groups = compileSelector(sel);
@@ -2260,6 +2315,7 @@ var HTTPClient = class _HTTPClient {
     if (config.signal && config.signal.aborted) {
       throw new AbortError();
     }
+    const originalData = data;
     if (config.rateLimiting.enabled) {
       try {
         await this.rateLimiter.checkLimit(urlObj.hostname, config.rateLimiting);
@@ -2376,13 +2432,19 @@ var HTTPClient = class _HTTPClient {
           }
           redirectCount++;
           this.metrics.redirects++;
+          let nextMethod = method;
+          let nextData = originalData;
+          if ((response.status === 301 || response.status === 302 || response.status === 303) && method !== "GET" && method !== "HEAD") {
+            nextMethod = "GET";
+            nextData = null;
+          }
           const location = response.headers.location;
           this.events.emit(events.REDIRECT, { from: url, to: location });
           const redirectUrl = location.includes("://") ? location : new URL(location, url).href;
           if (response.data && typeof response.data.destroy === "function") {
             response.data.destroy();
           }
-          return this.request(method, redirectUrl, data, {
+          return this.request(nextMethod, redirectUrl, nextData, {
             ...config,
             params: void 0,
             redirectCount,
@@ -3044,18 +3106,24 @@ var HTTPClient = class _HTTPClient {
         return result.then(
           finish,
           (error) => {
-            error.response = response;
-            error.type = type;
-            throw error;
+            throw this._wrapTransformError(error, response, type);
           }
         );
       }
       return finish(result);
     } catch (error) {
-      error.response = response;
-      error.type = type;
-      throw error;
+      throw this._wrapTransformError(error, response, type);
     }
+  }
+  // A transformer failure (e.g. "Invalid JSON response") means the SERVER
+  // sent data we could not parse — a response problem, not a request one.
+  // Surface it as a ResponseError (code RESPONSE_ERROR) carrying the raw
+  // response, matching axios's ERR_BAD_RESPONSE semantics.
+  _wrapTransformError(error, response, type) {
+    if (error instanceof SwiftlyError) return error;
+    const wrapped = new ResponseError(error.message, response);
+    wrapped.type = type;
+    return wrapped;
   }
   async _compressData(data, config = this.config) {
     let jsonStr;
@@ -3436,7 +3504,12 @@ function resolveUrl(href, baseUrl) {
     return href;
   }
 }
+function baseHrefOf(html) {
+  const el = parseHTML(html, "base[href]")[0];
+  return el ? el.attr("href") : null;
+}
 function extractLinks(html, baseUrl = null) {
+  const base = baseUrl || baseHrefOf(html);
   const seen = /* @__PURE__ */ new Set();
   const out = [];
   for (const el of parseHTML(html, "a[href]")) {
@@ -3446,12 +3519,13 @@ function extractLinks(html, baseUrl = null) {
     out.push({
       text: el.content,
       href,
-      url: baseUrl ? resolveUrl(href, baseUrl) : href
+      url: base ? resolveUrl(href, base) : href
     });
   }
   return out;
 }
 function extractImages(html, baseUrl = null) {
+  const base = baseUrl || baseHrefOf(html);
   const seen = /* @__PURE__ */ new Set();
   const out = [];
   for (const el of parseHTML(html, "img[src]")) {
@@ -3460,7 +3534,7 @@ function extractImages(html, baseUrl = null) {
     seen.add(src);
     out.push({
       src,
-      url: baseUrl ? resolveUrl(src, baseUrl) : src,
+      url: base ? resolveUrl(src, base) : src,
       alt: el.attr("alt"),
       title: el.attr("title")
     });
@@ -3486,7 +3560,10 @@ function extractMeta(html) {
 function extractTables(html, selector = "table") {
   return parseHTML(html, selector).map((tbl) => {
     const rows = tbl.find("tr").map(
-      (tr) => tr.find("th, td").map((c) => c.content)
+      (tr) => tr.find("th, td").flatMap((c) => {
+        const span = parseInt(c.attr("colspan"), 10) || 1;
+        return Array(span).fill(c.content);
+      })
     );
     const headers = rows.length ? rows[0].map((h) => h.trim()) : [];
     const body = rows.slice(1).map((row) => {
@@ -3622,45 +3699,65 @@ function sanitizeHtml(html, options = {}) {
 }
 function htmlToMarkdown(html) {
   let md = sanitizeHtml(html);
-  md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_, t) => `
+  md = md.replace(/<img(?=[\s/>])[^>]*>/gi, (tag) => {
+    const src = /src=["']([^"']+)["']/i.exec(tag);
+    if (!src) return "";
+    const alt = /alt=["']([^"']*)["']/i.exec(tag);
+    return `![${alt ? alt[1] : src[1]}](${src[1]})`;
+  });
+  md = md.replace(/<hr(?=[\s/>])[^>]*>/gi, "\n---\n");
+  md = md.replace(/<h1(?=[\s/>])[^>]*>([\s\S]*?)<\/h1>/gi, (_, t) => `
 # ${t.trim()}
 
 `);
-  md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_, t) => `
+  md = md.replace(/<h2(?=[\s/>])[^>]*>([\s\S]*?)<\/h2>/gi, (_, t) => `
 ## ${t.trim()}
 
 `);
-  md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, (_, t) => `
+  md = md.replace(/<h3(?=[\s/>])[^>]*>([\s\S]*?)<\/h3>/gi, (_, t) => `
 ### ${t.trim()}
 
 `);
-  md = md.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, (_, t) => `
+  md = md.replace(/<h4(?=[\s/>])[^>]*>([\s\S]*?)<\/h4>/gi, (_, t) => `
 #### ${t.trim()}
 
 `);
-  md = md.replace(/<h5[^>]*>([\s\S]*?)<\/h5>/gi, (_, t) => `
+  md = md.replace(/<h5(?=[\s/>])[^>]*>([\s\S]*?)<\/h5>/gi, (_, t) => `
 ##### ${t.trim()}
 
 `);
-  md = md.replace(/<h6[^>]*>([\s\S]*?)<\/h6>/gi, (_, t) => `
+  md = md.replace(/<h6(?=[\s/>])[^>]*>([\s\S]*?)<\/h6>/gi, (_, t) => `
 ###### ${t.trim()}
 
 `);
-  md = md.replace(/<(?:strong|b)[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, "**$1**");
-  md = md.replace(/<(?:em|i)[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, "*$1*");
-  md = md.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_, t) => `
+  md = md.replace(/<(?:strong|b)(?=[\s/>])[^>]*>([\s\S]*?)<\/(?:strong|b)>/gi, "**$1**");
+  md = md.replace(/<(?:em|i)(?=[\s/>])[^>]*>([\s\S]*?)<\/(?:em|i)>/gi, "*$1*");
+  md = md.replace(/<pre(?=[\s/>])[^>]*>([\s\S]*?)<\/pre>/gi, (_, t) => `
 \`\`\`
 ${t.replace(/<[^>]+>/g, "").trim()}
 \`\`\`
 `);
-  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
-  md = md.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
-  md = md.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_, t) => `- ${t.trim()}
+  md = md.replace(/<code(?=[\s/>])[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
+  md = md.replace(/<ol(?=[\s/>])[^>]*>([\s\S]*?)<\/ol>/gi, (_, inner) => {
+    let n = 0;
+    return inner.replace(/<li(?=[\s/>])[^>]*>([\s\S]*?)<\/li>/gi, (__, t) => `${++n}. ${t.trim()}
 `);
+  });
+  md = md.replace(/<ul(?=[\s/>])[^>]*>([\s\S]*?)<\/ul>/gi, (_, inner) => {
+    return inner.replace(/<li(?=[\s/>])[^>]*>([\s\S]*?)<\/li>/gi, (__, t) => `- ${t.trim()}
+`);
+  });
+  md = md.replace(/<li(?=[\s/>])[^>]*>([\s\S]*?)<\/li>/gi, (_, t) => `- ${t.trim()}
+`);
+  md = md.replace(/<a(?=[\s/>])[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
   md = md.replace(/<br\s*\/?\s*>/gi, "\n");
-  md = md.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_, t) => `
+  md = md.replace(/<p(?=[\s/>])[^>]*>([\s\S]*?)<\/p>/gi, (_, t) => `
 ${t.trim()}
 `);
+  md = md.replace(/<blockquote(?=[\s/>])[^>]*>([\s\S]*?)<\/blockquote>/gi, (_, t) => {
+    const lines = t.replace(/\n{2,}/g, "\n").split("\n").filter((l) => l.trim() !== "");
+    return "\n" + lines.map((l) => `> ${l.trim()}`).join("\n") + "\n";
+  });
   md = md.replace(/<\/?[^>]+>/g, "");
   return decodeEntities(md.replace(/\n{3,}/g, "\n\n").trim());
 }
@@ -4067,9 +4164,10 @@ function tokenizePath(path) {
         parts.push({ type: "any" });
       } else if (inner[0] === "'" || inner[0] === '"') {
         parts.push({ type: "key", value: inner.slice(1, -1) });
+      } else if (/^-?\d+$/.test(inner)) {
+        parts.push({ type: "index", value: parseInt(inner, 10) });
       } else {
-        const idx = parseInt(inner, 10);
-        parts.push(isNaN(idx) ? { type: "key", value: inner } : { type: "index", value: idx });
+        parts.push({ type: "key", value: inner });
       }
       i = end + 1;
       continue;
@@ -4112,7 +4210,11 @@ function evaluate(nodes, parts, idx) {
   return evaluate(next, parts, idx + 1);
 }
 function queryJSON(data, path, fallback) {
-  const parts = tokenizePath(String(path));
+  let p = String(path);
+  if (p.startsWith("$")) {
+    p = p.slice(1).replace(/^\./, "");
+  }
+  const parts = tokenizePath(p);
   if (parts.length === 0) return fallback;
   const results = evaluate([data], parts, 0);
   if (results.length === 0) return fallback;
@@ -4272,8 +4374,13 @@ export {
  *
  * A zero-dependency, lightweight HTML parser + CSS-like selector engine.
  * Supports tag/id/class/attribute selectors, combinators (descendant, child,
- * adjacent, sibling), pseudo-classes (:first/:last/:nth-child/:nth-of-type/
- * :contains/:not/:empty/:has), attribute operators and comma groups.
+ * adjacent, sibling), pseudo-classes (:first/:last/:eq/:first-child/
+ * :last-child/:first-of-type/:last-of-type/:only-child/:only-of-type/
+ * :nth-child/:nth-last-child/:nth-of-type/:nth-last-of-type/:contains/
+ * :not/:empty/:has), attribute operators and comma groups.
+ *
+ * :first/:last/:eq are set-relative (they select from the full match set in
+ * document order, like jQuery); the *-child/*-of-type forms are structural.
  *
  * Note: it is intentionally lighter than a full DOM. For very heavy scraping
  * pair Swiftly with a full parser.
