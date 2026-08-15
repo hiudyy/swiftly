@@ -1,0 +1,101 @@
+{
+  "name": "swiftly",
+  "version": "1.1.0",
+  "description": "The fastest, lightest HTTP client for Node.js. Zero dependencies.",
+  "type": "module",
+  "main": "index.cjs",
+  "module": "dist/index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "index.cjs",
+    "index.mjs",
+    "index.d.ts",
+    "bin",
+    "lib"
+  ],
+  "bin": {
+    "swiftly": "bin/swiftly.js"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "node -c index.mjs && node -c lib/*.js && node -c bin/swiftly.js && echo 'Syntax check passed'",
+    "bench": "node benchmarks/bench.js",
+    "prepublishOnly": "npm run build",
+    "start": "node index.mjs",
+    "cli": "node bin/swiftly.js"
+  },
+  "keywords": [
+    "http",
+    "https",
+    "http2",
+    "client",
+    "request",
+    "fetch",
+    "axios",
+    "got",
+    "superagent",
+    "rest",
+    "api",
+    "scraping",
+    "scraper",
+    "web-scraping",
+    "html-parser",
+    "circuit-breaker",
+    "rate-limiter",
+    "cache",
+    "retry",
+    "graphql",
+    "sse",
+    "server-sent-events",
+    "zero-dependencies",
+    "lightweight",
+    "fast",
+    "performance",
+    "ipv6",
+    "compression",
+    "cookies",
+    "session",
+    "interceptor",
+    "metrics",
+    "monitoring",
+    "cli",
+    "download",
+    "batch",
+    "async",
+    "promise"
+  ],
+  "author": "Cognima",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.13.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cognima/swiftly.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cognima/swiftly/issues"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "axios": "^1.19.0",
+    "esbuild": "^0.24.2",
+    "got": "^15.1.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
