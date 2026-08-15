@@ -2,7 +2,7 @@
 
 /**
  * Swiftly CLI
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 

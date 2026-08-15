@@ -89,17 +89,17 @@
     "async",
     "promise"
   ],
-  "author": "Cognima",
+  "author": "hiudy",
   "license": "MIT",
   "engines": {
     "node": ">=14.13.0"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cognima/swiftly.git"
+    "url": "git+https://github.com/hiudyy/swiftly.git"
   },
   "bugs": {
-    "url": "https://github.com/cognima/swiftly/issues"
+    "url": "https://github.com/hiudyy/swiftly/issues"
   },
   "peerDependencies": {
     "undici": ">=6"

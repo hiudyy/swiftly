@@ -1,6 +1,6 @@
 /**
  * Swiftly - Lightweight HTTP client (ESM entry)
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 

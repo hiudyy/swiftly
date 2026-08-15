@@ -256,6 +256,13 @@ describe('client cache', () => {
         // same key -> second is a hit
         expect(c.getMetrics().cacheHits).toBeGreaterThanOrEqual(1);
     });
+    it('does not share cached responses across different auth', async () => {
+        const c = mk({ cache: { enabled: true, ttl: 5000 } });
+        const a = await c.get(`${srv.url}/headers`, { bearer: 'AAA' });
+        const b = await c.get(`${srv.url}/headers`, { bearer: 'BBB' });
+        expect(a.headers.authorization).toBe('Bearer AAA');
+        expect(b.headers.authorization).toBe('Bearer BBB');
+    });
 });
 
 describe('client cookies', () => {

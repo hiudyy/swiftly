@@ -12,7 +12,7 @@ describe('headers.generateHeaders', () => {
     });
     it('uses the default User-Agent constant when none provided', () => {
         const h = generateHeaders();
-        expect(h['User-Agent']).toBe('Swiftly/1.0 (+https://github.com/cognima/swiftly)');
+        expect(h['User-Agent']).toBe('Swiftly/1.0 (+https://github.com/hiudyy/swiftly)');
     });
     it('honors a custom userAgent', () => {
         const h = generateHeaders({ userAgent: 'MyAgent/2.0' });

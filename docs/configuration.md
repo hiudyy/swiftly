@@ -1,98 +1,108 @@
 # Configuration
 
-Every option is optional. Swiftly applies **performance-first defaults** — no
-artificial delays, no throttling, no log spam — so it is fast out of the box.
-
-Pass options to the factory (`swiftly(opts)`) or per-request
-(`client.get(url, opts)`). Per-request options are deep-merged over instance
-options.
+All options are passed to `swiftly(config)`. Every option is optional; defaults
+are performance-first (no timeout, no rate limiting, caching on).
 
 ## Networking
 
 | Option | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| `timeout` | `number` | `30000` | Overall request timeout (ms) |
-| `timeouts.connect` | `number` | `5000` | Connection timeout (ms) |
-| `timeouts.response` | `number` | `30000` | Time to receive response headers (ms) |
-| `timeouts.idle` | `number` | `60000` | Max idle gap between data chunks (ms) |
-| `useHttp2` | `boolean` | `false` | Use HTTP/2 over HTTPS |
-| `validateSSL` | `boolean` | `true` | Reject invalid TLS certificates |
-| `baseURL` | `string \| null` | `null` | Prefix for relative URLs |
-| `proxy` | `object \| null` | `null` | `{ host, port, auth? }` |
+| `baseURL` | `string` | `null` | Prefix applied to relative request URLs. |
+| `timeout` | `number` | `null` | Per-request socket timeout in ms (opt-in; no timer is created unless set). |
+| `timeouts` | `object` | `null` | Connect/response/idle timers: `{ connect, response, idle }` in ms. |
+| `followRedirects` | `boolean` | `true` | Automatically follow 3xx responses. |
+| `maxRedirects` | `number` | `5` | Maximum number of redirects to follow. |
+| `validateSSL` | `boolean` | `true` | Reject invalid TLS certificates. |
+| `useHttp2` | `boolean` | `false` | Use HTTP/2 when available. |
+| `transport` | `'http' \| 'undici'` | `'http'` | Underlying transport (`undici` is an optional peer dependency, lazy-loaded). |
+| `proxy` | `object` | `null` | `{ host, port, auth? }` HTTP/HTTPS proxy. |
+| `decompress` | `boolean` | `true` | Automatically decompress gzip/deflate/br responses. |
 
 ## Retries & redirects
 
 | Option | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| `retries` | `number` | `3` | Attempts for transient (5xx/network) errors |
-| `retryDelay` | `number` | `1000` | Base delay (ms); grows linearly per attempt |
-| `followRedirects` | `boolean` | `true` | Follow 301/302/303/307/308 |
-| `maxRedirects` | `number` | `5` | Max redirect hops |
-
-4xx errors are **never** retried (except 429). Hard failures such as exceeding
-`maxRedirects` are not retried either.
+| `retries` | `number` | `3` | Total attempts (1 = one try, no retry). |
+| `retryDelay` | `number` | `1000` | Base delay between attempts (ms). |
+| `retryBackoff` | `number` | `null` | Exponential factor (>= 1); linear when omitted. |
+| `retryJitter` | `boolean` | `false` | Add randomized jitter to the backoff. |
+| `retryOn` | `number[] \| (err) => boolean` | `null` | Status codes / predicate that decides whether to retry. |
+| `maxRetryAfter` | `number` | `60000` | Cap (ms) for an honored `Retry-After` header. |
+| `onRetry` | `(attempt, error, delay) => void` | `null` | Hook called before each retry. |
 
 ## Performance controls
 
-| Option | Type | Default | Notes |
-| ------ | ---- | ------- | ----- |
-| `humanize` | `boolean` | `false` | Adds a random 500–1500ms delay. Keep OFF |
-| `debug` | `boolean` | `false` | Prints request logs. Keep OFF |
-| `rateLimiting.enabled` | `boolean` | `false` | Throttle per domain. Keep OFF |
-| `rateLimiting.requestsPerSecond` | `number` | `2` | Used when enabled |
-| `rateLimiting.maxDelay` | `number` | `64000` | Max throttle wait (ms) |
-| `rateLimiting.minDelay` | `number` | `1000` | Min throttle wait (ms) |
-| `randomizeHeaders` | `boolean` | `false` | Rotate UA / Accept-Language |
-| `deduplicate` | `boolean` | `true` | Collapse concurrent identical GETs |
-
-> The defaults exist so Swiftly is **fast and predictable**. Enable
-> `humanize`, `debug` or rate limiting only when you explicitly want them.
+| Option | Type | Default | Description |
+| ------ | ---- | ------- | ----------- |
+| `keepAlive` | `boolean` | `true` | Reuse TCP connections (connection pooling). |
+| `maxSockets` | `number` | `Infinity` | Max concurrent sockets per origin. |
+| `maxFreeSockets` | `number` | `256` | Idle sockets kept alive. |
+| `agent` | `http.Agent` | `null` | Custom agent override. |
+| `humanize` | `boolean` | `false` | Add artificial delay between requests. |
+| `compression` | `object` | `{ request: true, response: true, minSize: 1024, responseMinSize: 0 }` | gzip/brotli request & response handling. |
+| `session` | `object` | `{ ttl: 3600000, maxSessions: 100, autoCleanup: true }` | HTTP/2 session pooling. |
 
 ## Caching
 
 | Option | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| `cache.enabled` | `boolean` | `true` | Cache 2xx GET responses in memory |
-| `cache.ttl` | `number` | `300000` | Cache lifetime (ms) |
-| `cache.maxSize` | `number` | `1000` | Max cached entries (LRU eviction) |
+| `cache.enabled` | `boolean` | `true` | Cache GET responses. |
+| `cache.ttl` | `number` | `300000` | Entry lifetime in ms. |
+| `cache.maxSize` | `number` | `1000` | Max number of entries (LRU eviction). |
+| `cache.staleWhileRevalidate` | `boolean` | `false` | Serve stale while refreshing in the background. |
+| `cache.keyBuilder` | `(method, url, data) => string` | `null` | Custom cache key. |
 
-Disable per request with `{ cache: { enabled: false } }`.
-
-## Compression
-
-| Option | Type | Default | Description |
-| ------ | ---- | ------- | ----------- |
-| `compression.request` | `boolean` | `true` | gzip outgoing JSON bodies |
-| `compression.response` | `boolean` | `true` | Decompress gzip/deflate/br |
-| `compression.minSize` | `number` | `1024` | Min request bytes to compress |
-| `compression.responseMinSize` | `number` | `0` | Min response bytes to decompress |
+The cache key is **auth-aware**: responses for different credentials
+(`auth` / `bearer` / `token` / `Authorization` header) are stored under
+separate keys, so one user's cached response is never returned to another.
 
 ## Resilience
 
 | Option | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| `circuitBreaker.enabled` | `boolean` | `false` | Open the circuit after failures |
-| `circuitBreaker.failureThreshold` | `number` | `5` | Failures before opening |
-| `circuitBreaker.resetTimeout` | `number` | `60000` | Wait before retrying (ms) |
+| `circuitBreaker.enabled` | `boolean` | `false` | Enable the per-domain circuit breaker. |
+| `circuitBreaker.failureThreshold` | `number` | `5` | Failures before the breaker opens. |
+| `circuitBreaker.resetTimeout` | `number` | `60000` | Cool-down before half-open recovery. |
+| `rateLimiting.enabled` | `boolean` | `false` | Enable per-domain rate limiting. |
+| `rateLimiting.requestsPerSecond` | `number` | `2` | Target request rate per domain. |
+| `rateLimiting.minDelay` / `maxDelay` | `number` | `1000` / `64000` | Backoff bounds for throttling. |
 
 ## Requests
 
 | Option | Type | Default | Description |
 | ------ | ---- | ------- | ----------- |
-| `responseType` | `string` | auto | `json` \| `text` \| `html` \| `buffer` |
-| `params` | `object` | `{}` | Extra query-string params |
-| `headers` | `object` | `{}` | Custom request headers |
-| `userAgent` | `string` | Swiftly UA | Custom User-Agent |
-| `responseSchema` | `object` | – | Basic type validation of the response |
-| `formData` | `boolean` | `false` | Send `data` as `multipart/form-data` |
+| `params` | `object` | – | Query string params (nested objects/arrays are serialized). |
+| `headers` | `object` | – | Request headers. |
+| `auth` | `{ username, password }` | `null` | Basic auth. |
+| `bearer` | `string` | `null` | Bearer token. |
+| `token` | `string` | `null` | Raw `Authorization` value. |
+| `responseType` | `'json' \| 'text' \| 'buffer' \| 'stream' \| 'raw'` | `'json'` | Expected/forced response shape. |
+| `responseSchema` | `function` | `null` | Validate/transform the parsed body (throws `ValidationError` on failure). |
+| `stream` | `boolean` | `false` | Return the raw response stream. |
+| `maxContentLength` / `maxBodyLength` | `number` | `Infinity` | Size guards. |
+| `randomizeHeaders` | `boolean` | `false` | Randomize header ordering. |
+| `debug` | `boolean` | `false` | Verbose logging. |
+
+### Hooks
+
+| Option | Signature | When |
+| ------ | --------- | ---- |
+| `onRequest` | `(config) => void` | before a request is sent |
+| `onResponse` | `(response) => void` | after a successful response |
+| `onError` | `(error) => void` | after a failed request |
+| `onDownloadProgress` | `({ loaded, total }) => void` | download progress |
+| `onUploadProgress` | `({ loaded, total }) => void` | upload progress |
 
 ## Configuration helpers
 
+On a client instance you can also change config at runtime:
+
 ```js
-const c = swiftly();
-c.setBaseURL('https://example.com');
-c.setTimeout(5000);
-c.setDefaultHeaders({ 'X-App': 'demo' });
-c.setDebug(false);
-c.getConfig(); // returns the effective config object
+const api = swiftly();
+
+api.setBaseURL('https://api.example.com');
+api.setTimeout(5000);
+api.setDefaultHeaders({ 'X-App': 'demo' });
+api.setDebug(true);
+api.getConfig(); // current config
 ```

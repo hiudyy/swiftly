@@ -8,7 +8,7 @@ import fs from "fs";
 import { Readable } from "stream";
 
 // lib/headers.js
-var DEFAULT_USER_AGENT = "Swiftly/1.0 (+https://github.com/cognima/swiftly)";
+var DEFAULT_USER_AGENT = "Swiftly/1.0 (+https://github.com/hiudyy/swiftly)";
 var userAgents = [
   DEFAULT_USER_AGENT,
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -31,6 +31,7 @@ function generateHeaders(config = {}) {
 }
 
 // lib/utils.js
+import querystring from "querystring";
 function detectResponseType(contentType = "") {
   contentType = String(contentType).toLowerCase();
   if (contentType.includes("application/json")) {
@@ -59,6 +60,17 @@ var delay = (ms, signal = null) => new Promise((resolve, reject) => {
     setTimeout(resolve, ms);
   }
 });
+var buildQueryString = (params) => {
+  const normalized = {};
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== null && typeof value === "object" && !(value instanceof Date)) {
+      normalized[key] = JSON.stringify(value);
+    } else {
+      normalized[key] = value;
+    }
+  }
+  return querystring.stringify(normalized);
+};
 
 // lib/events.js
 var EventEmitter = class {
@@ -231,6 +243,32 @@ var CookieJar = class {
     }
     return target;
   }
+  // Parse a target (URL or bare host) into the pieces used for matching.
+  _parseTarget(target) {
+    let hostname = "";
+    let protocol = null;
+    let pathname = "/";
+    if (target && typeof target === "string" && target.includes("://")) {
+      try {
+        const u = new URL(target);
+        hostname = u.hostname.toLowerCase();
+        protocol = u.protocol;
+        pathname = u.pathname || "/";
+      } catch {
+        hostname = target.toLowerCase();
+      }
+    } else {
+      hostname = (target || "").toLowerCase();
+    }
+    return { hostname, protocol, pathname };
+  }
+  // RFC 6265 domain matching: a host-only cookie matches the exact host
+  // only; a domain cookie also matches any subdomain of its domain.
+  _domainMatches(requestHost, cookieDomain, hostOnly) {
+    if (hostOnly) return requestHost === cookieDomain;
+    if (requestHost === cookieDomain) return true;
+    return requestHost.endsWith("." + cookieDomain);
+  }
   /**
    * Public: set a cookie by URL (or domain) + name/value, or by name object,
    * or with a raw `Set-Cookie` header string as the second argument.
@@ -245,11 +283,12 @@ var CookieJar = class {
     if (!domain || typeof domain !== "string") {
       throw new Error("Domain must be a non-empty string");
     }
+    const reqDomain = domain.toLowerCase();
     if (typeof name === "string" && name.includes("=") && !name.includes("://")) {
-      return this._setFromHeader(domain, name);
+      return this._setFromHeader(reqDomain, name);
     }
-    if (!this.cookies.has(domain)) {
-      this.cookies.set(domain, /* @__PURE__ */ new Map());
+    if (!this.cookies.has(reqDomain)) {
+      this.cookies.set(reqDomain, /* @__PURE__ */ new Map());
     }
     let entry;
     if (typeof name === "object" && name !== null) {
@@ -260,38 +299,54 @@ var CookieJar = class {
     if (!entry.name) {
       throw new Error("Cookie name cannot be empty");
     }
-    this.cookies.get(domain).set(entry.name, {
+    const cookieDomain = entry.domain ? String(entry.domain).toLowerCase().replace(/^\./, "") : reqDomain;
+    const hostOnly = !entry.domain;
+    this.cookies.get(cookieDomain).set(entry.name, {
       value: String(entry.value),
       expires: entry.expires instanceof Date ? entry.expires : entry.expires ? new Date(entry.expires) : null,
       httpOnly: !!entry.httpOnly,
       secure: !!entry.secure,
       sameSite: entry.sameSite || "Lax",
-      path: entry.path || "/"
+      _domain: cookieDomain,
+      _hostOnly: hostOnly,
+      _path: entry.path || "/"
     });
     return this;
   }
   // Internal: store a raw `Set-Cookie` response header for a domain.
+  // Honors the Domain, Path, Secure, HttpOnly and SameSite attributes.
   _setFromHeader(domain, cookie) {
-    if (!this.cookies.has(domain)) {
-      this.cookies.set(domain, /* @__PURE__ */ new Map());
-    }
+    const reqDomain = domain.toLowerCase();
     try {
-      const cookieParts = cookie.split(";")[0].split("=");
-      if (cookieParts.length < 2) {
-        throw new Error("Invalid cookie format");
-      }
-      const name = cookieParts[0].trim();
-      const value = cookieParts.slice(1).join("=").trim();
-      if (!name) {
-        throw new Error("Cookie name cannot be empty");
+      const parts = cookie.split(";").map((s) => s.trim()).filter(Boolean);
+      if (parts.length === 0) throw new Error("Invalid cookie format");
+      const first = parts[0].split("=");
+      if (first.length < 2) throw new Error("Invalid cookie format");
+      const name = first[0].trim();
+      const value = first.slice(1).join("=").trim();
+      if (!name) throw new Error("Cookie name cannot be empty");
+      const getAttr = (attr) => {
+        const p = parts.find((x) => x.toLowerCase().startsWith(attr.toLowerCase() + "="));
+        return p ? p.slice(p.indexOf("=") + 1).trim() : null;
+      };
+      const domainAttr = getAttr("Domain");
+      const pathAttr = getAttr("Path");
+      const sameSiteAttr = getAttr("SameSite");
+      const cookieDomain = domainAttr ? domainAttr.toLowerCase().replace(/^\./, "") : reqDomain;
+      const hostOnly = !domainAttr;
+      if (!this.cookies.has(cookieDomain)) {
+        this.cookies.set(cookieDomain, /* @__PURE__ */ new Map());
       }
       const full = cookie.toLowerCase();
-      this.cookies.get(domain).set(name, {
+      this.cookies.get(cookieDomain).set(name, {
         value,
         expires: this._getExpiryFromCookie(cookie),
         httpOnly: full.includes("httponly"),
         secure: full.includes("secure"),
-        sameSite: this._getSameSiteFromCookie(cookie)
+        sameSite: sameSiteAttr || "Lax",
+        _domain: cookieDomain,
+        _hostOnly: hostOnly,
+        _path: pathAttr || "/"
       });
     } catch (error) {
     }
@@ -299,28 +354,43 @@ var CookieJar = class {
   }
   /**
    * Get cookies for a URL/domain as a `Cookie` header value.
+   * Respects the Domain (incl. subdomains), Path and Secure attributes.
    * @param {string} url - URL or domain
    * @returns {string}
    */
   getCookies(url) {
-    const domain = this._domainOf(url);
     if (this.cookies.size === 0) return "";
     this._clearExpired();
-    const cookies = this.cookies.get(domain);
-    if (!cookies) return "";
-    return Array.from(cookies.entries()).map(([name, data]) => `${name}=${data.value}`).join("; ");
+    const { hostname, protocol, pathname } = this._parseTarget(url);
+    const out = [];
+    for (const [domainKey, cookies] of this.cookies) {
+      for (const [name, data] of cookies) {
+        if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
+        if (!pathname.startsWith(data._path)) continue;
+        if (data.secure && protocol !== "https:") continue;
+        out.push(`${name}=${data.value}`);
+      }
+    }
+    return out.join("; ");
   }
   /**
-   * Get the full cookie map for a URL/domain.
+   * Get the full cookie map for a URL/domain (for inspection; secure
+   * cookies are included regardless of the request protocol).
    * @param {string} url - URL or domain
    * @returns {Array<{name, value, expires, httpOnly, secure, sameSite, path}>}
    */
   getCookiesMap(url) {
-    const domain = this._domainOf(url);
     this._clearExpired();
-    const cookies = this.cookies.get(domain);
-    if (!cookies) return [];
-    return Array.from(cookies.entries()).map(([name, data]) => ({ name, ...data }));
+    const { hostname, pathname } = this._parseTarget(url);
+    const out = [];
+    for (const [domainKey, cookies] of this.cookies) {
+      for (const [name, data] of cookies) {
+        if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
+        if (!pathname.startsWith(data._path)) continue;
+        out.push({ name, ...data });
+      }
+    }
+    return out;
   }
   /**
    * Remove cookies for a URL/domain (or all if omitted).
@@ -561,6 +631,9 @@ var CacheStore = class {
     const parts = [method.toUpperCase(), u];
     if (data) {
       parts.push(typeof data === "string" ? data : JSON.stringify(data));
+    }
+    if (options.vary) {
+      parts.push("vary:" + options.vary);
     }
     return parts.join("|");
   }
@@ -985,14 +1058,28 @@ var HTTPClient = class _HTTPClient {
       }
       const urlObj = new URL(fullUrl);
       if (params) {
-        Object.entries(params).forEach(([key, value]) => {
-          urlObj.searchParams.append(key, value);
-        });
+        const qs = buildQueryString(params);
+        if (qs) {
+          urlObj.search = urlObj.search ? `${urlObj.search}&${qs}` : `?${qs}`;
+        }
       }
       return urlObj.toString();
     } catch (error) {
       throw new Error(`Invalid URL: ${url}`);
     }
+  }
+  // Compute an auth identity string used to vary the cache key, so that
+  // responses for different credentials are never shared (prevents
+  // leaking one user's cached response to another on the same endpoint).
+  _authVary(config) {
+    const parts = [
+      config.headers && config.headers["Authorization"],
+      config.auth && config.auth.username,
+      config.auth && config.auth.password,
+      config.bearer,
+      config.token
+    ];
+    return parts.filter(Boolean).join("|");
   }
   // Métodos HTTP melhorados
   async get(url, config = {}) {
@@ -1175,7 +1262,10 @@ var HTTPClient = class _HTTPClient {
     const isGet = upperMethod === "GET";
     const formattedUrl = this._formatUrl(url, config.params);
     if (config.cache.enabled && isGet && !config.stream) {
-      const cacheKey = this.cache.getCacheKey(upperMethod, formattedUrl, data, config.cache);
+      const cacheKey = this.cache.getCacheKey(upperMethod, formattedUrl, data, {
+        ...config.cache,
+        vary: this._authVary(config)
+      });
       if (config.cache.staleWhileRevalidate) {
         const peeked = this.cache.peek(cacheKey);
         if (peeked) {
@@ -1272,7 +1362,7 @@ var HTTPClient = class _HTTPClient {
       const hostKey = `${urlObj.hostname}:${urlObj.port || (urlObj.protocol === "https:" ? 443 : 80)}`;
       options.agent = getAgent(urlObj.protocol, hostKey, config, this.connectionPool);
     }
-    const cookies = this.cookieJar.getCookies(urlObj.hostname);
+    const cookies = this.cookieJar.getCookies(urlObj.href);
     if (cookies) {
       options.headers["Cookie"] = cookies;
     }
@@ -1334,6 +1424,9 @@ var HTTPClient = class _HTTPClient {
       try {
         const response = circuitBreaker ? await circuitBreaker.execute(performRequest, urlObj.hostname) : await performRequest();
         if (useHttp2) this.metrics.http2Requests++;
+        if (circuitBreaker && response.status >= 500) {
+          circuitBreaker.handleFailure(urlObj.hostname);
+        }
         if (config.followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
           if (redirectCount >= config.maxRedirects) {
             const err = new Error(`Max redirects exceeded (${config.maxRedirects})`);
@@ -1363,13 +1456,6 @@ var HTTPClient = class _HTTPClient {
           });
         }
         const processedResponse = this.interceptors.response.handlers.length > 0 ? await this.interceptors.response.executeResponseChain(response) : response;
-        if (config.responseSchema && !streamMode) {
-          const type = detectResponseType(processedResponse.headers["content-type"] || "");
-          const validator = this.responseValidators.get(type);
-          if (validator) {
-            validator(processedResponse.data, config.responseSchema);
-          }
-        }
         const requestTime = Date.now() - startTime;
         processedResponse.duration = requestTime;
         const bodyLength = processedResponse.data ? processedResponse.data.length ?? 0 : 0;
@@ -1409,8 +1495,18 @@ var HTTPClient = class _HTTPClient {
         }
         const processed = this._processResponse(processedResponse, config.responseType);
         const result = processed && typeof processed.then === "function" ? await processed : processed;
+        if (config.responseSchema && !streamMode && config.responseType !== "raw") {
+          const type = detectResponseType(processedResponse.headers["content-type"] || "");
+          const validator = this.responseValidators.get(type);
+          if (validator) {
+            validator(result, config.responseSchema);
+          }
+        }
         if (config.cache.enabled && method === "GET" && processedResponse.status === 200 && !streamMode) {
-          const cacheKey = this.cache.getCacheKey(method, url, data, config.cache);
+          const cacheKey = this.cache.getCacheKey(method, url, data, {
+            ...config.cache,
+            vary: this._authVary(config)
+          });
           this.cache.set(cacheKey, result, config.cache.ttl);
           this._emit(events.CACHE_STORE, () => ({ url }));
         }
@@ -1503,7 +1599,9 @@ var HTTPClient = class _HTTPClient {
     const authority = `${urlObj.hostname}:${urlObj.port || 443}`;
     let session = this.http2Sessions.get(authority);
     if (!session || session.destroyed) {
-      session = http22.connect(urlObj.href);
+      session = http22.connect(urlObj.href, {
+        rejectUnauthorized: options.rejectUnauthorized
+      });
       this.http2Sessions.set(authority, session);
       session.on("error", () => {
         this.http2Sessions.delete(authority);
@@ -2087,12 +2185,15 @@ var HTTPClient = class _HTTPClient {
       if (typeof reqOptions.timeout !== "number") delete reqOptions.timeout;
       const req = client.request(urlObj, reqOptions, (res) => {
         if (res.statusCode !== 200) {
-          reject(new Error(`SSE connection failed: ${res.statusCode}`));
+          const err = new Error(`SSE connection failed: ${res.statusCode}`);
+          if (onError) onError(err);
+          reject(err);
           return;
         }
         res.setEncoding("utf8");
         let buffer = "";
         if (onOpen) onOpen();
+        resolve(() => req.destroy());
         res.on("data", (chunk) => {
           buffer += chunk;
           const lines = buffer.split("\n");
@@ -2119,7 +2220,6 @@ var HTTPClient = class _HTTPClient {
         reject(error);
       });
       req.end();
-      resolve(() => req.destroy());
     });
   }
   // Event handling methods
@@ -2185,6 +2285,16 @@ var HTTPClient = class _HTTPClient {
     const { onProgress } = config;
     const total = stream.total || 0;
     let loaded = 0;
+    if (typeof stream.status === "number" && stream.status >= 400) {
+      try {
+        stream.destroy();
+      } catch {
+      }
+      throw new ResponseError(`HTTP Error ${stream.status}`, {
+        status: stream.status,
+        headers: stream.headers || {}
+      });
+    }
     return new Promise((resolve, reject) => {
       const ws = fs.createWriteStream(filePath);
       stream.on("data", (chunk) => {
@@ -3690,47 +3800,47 @@ export {
 };
 /**
  * Header Generation Utils
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Utility Functions
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Event System Implementation
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Request/Response Interceptor System
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Rate Limiter Implementation
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Cache System Implementation (v2)
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Connection Pooling (keep-alive Agents)
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Custom Error Classes
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * HTTP Client Implementation
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
@@ -3743,35 +3853,35 @@ export {
  *
  * Note: it is intentionally lighter than a full DOM. For very heavy scraping
  * pair Swiftly with a full parser.
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Extraction utilities built on top of the HTML parser.
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Lightweight XML parser + serialization + feed helpers (RSS/Atom/sitemap).
  * Zero dependencies.
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * CSV parser & serializer (quotes, embedded delimiters/newlines, CRLF).
  * Zero dependencies.
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * JSONPath-style query helper (dot/bracket notation, wildcards, numeric indexes).
  * Zero dependencies.
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 /**
  * Swiftly - Lightweight HTTP client (ESM entry)
- * @author Cognima
+ * @author hiudy
  * @license MIT
  */
 //# sourceMappingURL=index.mjs.map

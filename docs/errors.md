@@ -1,61 +1,81 @@
 # Errors
 
-Swiftly throws typed errors. All of them extend `SwiftlyError`, which extends
-the built-in `Error` and carries a stable `code` you can switch on.
+Every error thrown by Swiftly extends `SwiftlyError` and carries a stable
+`code`, so you can branch on it reliably.
 
 ## Error types
 
-| Error | `code` | When it's thrown |
-| ----- | ------ | ---------------- |
-| `SwiftlyError` | (base) | Base class for all Swiftly errors |
-| `ValidationError` | `VALIDATION_ERROR` | Invalid method, URL, data, headers or config |
-| `RequestError` | `REQUEST_ERROR` | Network failures (ECONNREFUSED, ENOTFOUND, ECONNRESET, DNS…) |
-| `ResponseError` | `RESPONSE_ERROR` | A non-2xx HTTP status; has `.response` |
-| `TimeoutError` | `TIMEOUT_ERROR` | Connect / response / idle timeout |
-| `CircuitBreakerError` | `CIRCUIT_BREAKER_ERROR` | Circuit breaker is open |
+| Error | `code` | When | Useful fields |
+| ----- | ------ | ---- | ------------- |
+| `ValidationError` | `VALIDATION_ERROR` | bad arguments / invalid URL | – |
+| `RequestError` | `REQUEST_ERROR` | network failure (DNS, ECONNREFUSED, socket) | `cause` |
+| `ResponseError` | `RESPONSE_ERROR` | non-2xx HTTP status | `response` (status, headers, body) |
+| `TimeoutError` | `TIMEOUT_ERROR` | connect/response/idle timeout exceeded | – |
+| `CircuitBreakerError` | `CIRCUIT_BREAKER_ERROR` | circuit breaker is open | `domain` |
 
-## Handling errors
+All errors expose `message` and `code`.
 
 ```js
-import swiftly, {
-    SwiftlyError,
-    RequestError,
-    ResponseError,
-    TimeoutError
-} from 'swiftly';
+import swiftly from 'swiftly';
 
 try {
-    await swiftly.get('https://example.com');
+  await swiftly.get('https://api.example.com/users/1');
 } catch (err) {
-    if (err instanceof TimeoutError) {
-        console.error('Timed out:', err.type); // 'connect' | 'response' | 'idle'
-    } else if (err instanceof ResponseError) {
-        console.error('HTTP', err.response.status, err.response.data);
-    } else if (err instanceof RequestError) {
-        console.error('Network error:', err.message);
-    } else if (err instanceof SwiftlyError) {
-        console.error('Swiftly error:', err.code);
-    }
+  switch (err.code) {
+    case 'RESPONSE_ERROR':
+      console.error('HTTP', err.response.status, err.response.body);
+      break;
+    case 'REQUEST_ERROR':
+      console.error('network:', err.cause);
+      break;
+    case 'TIMEOUT_ERROR':
+      console.error('timed out');
+      break;
+    case 'CIRCUIT_BREAKER_ERROR':
+      console.error('breaker open for', err.domain);
+      break;
+  }
 }
 ```
 
-Or switch on the code:
+## Handling errors
+
+- **`ResponseError`** gives you the full server response, so you can read the
+  status and body even on failure.
+- **`RequestError`** wraps low-level network issues; the original error is on
+  `err.cause`.
+- Interceptors can also recover from errors via a `rejected` handler:
 
 ```js
-catch (err) {
-    switch (err.code) {
-        case 'RESPONSE_ERROR': /* ... */ break;
-        case 'TIMEOUT_ERROR':  /* ... */ break;
-        case 'VALIDATION_ERROR': /* ... */ break;
+api.interceptors.response.use(
+  null,
+  (error) => {
+    if (error.code === 'RESPONSE_ERROR' && error.response.status === 401) {
+      // e.g. refresh a token and retry
     }
-}
+    throw error;
+  }
+);
 ```
 
 ## Retry behavior
 
-- **5xx** responses and **network errors** are retried up to `retries` times.
-- **4xx** responses are **never** retried (except HTTP 429).
-- **Exceeding `maxRedirects`** throws immediately (never retried).
+Retries are automatic and configurable (`retries`, `retryDelay`,
+`retryBackoff`, `retryJitter`, `retryOn`, `maxRetryAfter`).
 
-> Note: `ResponseError`/`TimeoutError` (typed Swiftly errors) are never wrapped
-> into a generic `RequestError`, so you can always rely on their type.
+- By default a request is attempted `retries` times (default `3`).
+- Backoff is linear unless `retryBackoff` (>= 1) is set for exponential growth;
+  `retryJitter` adds randomness to avoid thundering herds.
+- `retryOn` restricts which failures retry — an array of status codes or a
+  predicate `(error) => boolean`. Network errors always retry.
+- A server `Retry-After` header is honored, capped by `maxRetryAfter`.
+- `onRetry(attempt, error, delay)` fires before each retry.
+
+```js
+const api = swiftly({
+  retries: 5,
+  retryBackoff: 2,
+  retryJitter: true,
+  retryOn: [429, 500, 502, 503, 504],
+});
+```
