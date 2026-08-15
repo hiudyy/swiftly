@@ -353,9 +353,6 @@ Fetch + parse in one step:
 const titles = await api.scrape('https://example.com', '.product-title');
 ```
 
-See [docs/scraping.md](https://github.com/hiudyy/swiftly/blob/master/docs/scraping.md)
-for the full selector syntax and the extraction suite.
-
 ## Error handling
 
 All errors extend `SwiftlyError` and carry a `code` — branch on `code`, never on
@@ -374,8 +371,6 @@ try {
   }
 }
 ```
-
-See [docs/errors.md](https://github.com/hiudyy/swiftly/blob/master/docs/errors.md).
 
 ## Events & metrics
 
@@ -397,12 +392,7 @@ swiftly scrape https://example.com -s '.main-content'
 
 ## Documentation
 
-- [Getting started](https://github.com/hiudyy/swiftly/blob/master/docs/getting-started.md)
-- [Configuration](https://github.com/hiudyy/swiftly/blob/master/docs/configuration.md)
-- [API reference](https://github.com/hiudyy/swiftly/blob/master/docs/api.md)
-- [Web scraping](https://github.com/hiudyy/swiftly/blob/master/docs/scraping.md)
-- [Errors](https://github.com/hiudyy/swiftly/blob/master/docs/errors.md)
-- [Recipes](https://github.com/hiudyy/swiftly/blob/master/docs/recipes.md)
+Full documentation, guides and recipes: [documentation index](https://github.com/hiudyy/swiftly/blob/master/docs/README.md)
 
 ## License
 
