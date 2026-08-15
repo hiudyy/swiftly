@@ -116,8 +116,8 @@ console.log(status, duration, headers['content-type'], data);
 Stream the body (retries are disabled for streams):
 
 ```js
-const { Readable } = await api.get('/file', { stream: true });
-for await (const chunk of Readable) process.stdout.write(chunk);
+const { data } = await api.get('/file', { stream: true });
+for await (const chunk of data) process.stdout.write(chunk);
 ```
 
 Download to a `Buffer` in one call:
@@ -207,7 +207,7 @@ const api = swiftly({
   auth: null,                          // { username, password } -> Basic
   bearer: null,                        // -> Authorization: Bearer <token>
   token: null,                         // -> Authorization: <token>
-  responseType: 'json',                // 'json'|'text'|'buffer'|'stream'|'raw'
+  responseType: 'json',                // 'json'|'text'|'html'|'buffer'|'raw' (default: auto-detected)
   responseSchema: { id: 'number' },    // type-map validated against the JSON body
   stream: false,                       // return the raw stream
   maxContentLength: Infinity,          // size guards
@@ -217,7 +217,7 @@ const api = swiftly({
 
   // ----- Hooks -----
   onRequest: (cfg) => console.log('→', cfg.method, cfg.url),
-  onResponse: (res) => console.log('←', res.status),
+  onResponse: (data, res) => console.log('←', res.status),
   onError: (err) => console.error('!', err.code),
   onDownloadProgress: ({ loaded, total }) => {},
   onUploadProgress: ({ loaded, total }) => {},
@@ -265,7 +265,7 @@ const data = await api.query('https://api.example.com/graphql', {
   query: `query ($id: ID!) { user(id: $id) { name } }`,
   variables: { id: 1 },
 });
-// data === response.body.data (throws with .graphqlErrors on server errors)
+// data is the GraphQL `data` field; throws Error with .graphqlErrors on server errors
 ```
 
 ## Server-Sent Events
@@ -363,7 +363,7 @@ try {
   await swiftly.get(url);
 } catch (err) {
   switch (err.code) {
-    case 'RESPONSE_ERROR':   console.error('HTTP', err.response.status, err.response.body); break;
+    case 'RESPONSE_ERROR':   console.error('HTTP', err.response.status, err.response.data); break;
     case 'REQUEST_ERROR':    console.error('network:', err.cause); break;
     case 'TIMEOUT_ERROR':    console.error('timed out'); break;
     case 'CIRCUIT_BREAKER_ERROR': console.error('breaker open:', err.domain); break;

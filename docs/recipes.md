@@ -1,261 +1,202 @@
 # Recipes
 
-Copy-paste patterns for real-world needs. Each snippet is self-contained.
+Copy-paste solutions for common scenarios. Each recipe is self-contained.
 
-## Authenticated client with token refresh
-
-Store a token, and on `401` refresh it and retry once:
+## 1. A reusable API client
 
 ```js
 import swiftly from 'swiftly';
 
-let token = await login(); // your auth flow
-const api = swiftly({ bearer: token });
+export const api = swiftly({
+  baseURL: 'https://api.example.com',
+  headers: { 'X-App': 'demo' },
+  timeout: 5000,
+  retries: 3,
+  retryBackoff: 2,
+  retryJitter: true,
+  cache: { enabled: true, ttl: 300_000 },
+});
 
-async function authed(method, url, data, config) {
-  try {
-    return await api[method](url, data, config);
-  } catch (err) {
-    if (err.code === 'RESPONSE_ERROR' && err.response.status === 401) {
-      token = await refreshToken();         // obtain a new token
-      api.setDefaultHeaders({ Authorization: `Bearer ${token}` });
-      return await api[method](url, data, config); // one retry
-    }
-    throw err;
-  }
-}
-
-const me = await authed('get', '/me');
+export const get = (path, config) => api.get(path, config);
+export const post = (path, data, config) => api.post(path, data, config);
 ```
 
-## A resilient client
+## 2. Auth session (login, then authed calls)
 
-Retries with backoff, a circuit breaker, a hard timeout, and per-domain rate
-limiting — a solid default for calling flaky downstream services:
+```js
+const api = swiftly();
+
+await api.post('https://example.com/login', {
+  username: 'alice',
+  password: 'secret',
+}); // server sets a session cookie
+
+const dashboard = await api.get('https://example.com/dashboard');
+// cookie is sent automatically
+```
+
+## 3. Bearer-token service
+
+```js
+const api = swiftly({ bearer: token, baseURL: 'https://api.example.com' });
+
+const refreshToken = async () => {
+  const { token: newToken } = await api.post('/auth/refresh');
+  api.setDefaultHeaders({ Authorization: `Bearer ${newToken}` });
+};
+```
+
+## 4. Resilient scraping loop with retries + delays
 
 ```js
 const api = swiftly({
-  timeout: 8000,
   retries: 4,
-  retryDelay: 500,
   retryBackoff: 2,
   retryJitter: true,
   retryOn: [429, 500, 502, 503, 504],
-  circuitBreaker: { enabled: true, failureThreshold: 5, resetTimeout: 60000 },
-  rateLimiting: { enabled: true, requestsPerSecond: 20 },
-});
-
-api.on('circuit:open', ({ domain }) => console.warn(`breaker open: ${domain}`));
-```
-
-## Caching strategy
-
-Cache GETs by default; use `staleWhileRevalidate` for snappy reads, and disable
-the cache per request when you need fresh data:
-
-```js
-const api = swiftly({
-  cache: { enabled: true, ttl: 60_000, staleWhileRevalidate: true },
-});
-
-await api.get('/config');                 // cached
-await api.get('/config');                 // instant (possibly stale, refreshed in bg)
-
-await api.get('/stock?sku=1', { cache: { enabled: false } }); // always fresh
-```
-
-Cache keys are **auth-aware**, so different credentials never share entries.
-
-## A polite, rate-limited crawler
-
-Crawl politely: throttle, add small delays, retry only on transient errors,
-and surface progress via events:
-
-```js
-const crawler = swiftly({
-  baseURL: 'https://example.com',
-  rateLimiting: { enabled: true, requestsPerSecond: 2 },
-  humanize: true,
-  retries: 3,
-  retryOn: [429, 500, 502, 503],
   randomizeHeaders: true,
-  headers: { 'User-Agent': 'swiftly-crawler/1.0 (+https://your.site)' },
+  circuitBreaker: { enabled: true, failureThreshold: 5, resetTimeout: 60_000 },
 });
 
-crawler.on('request:end', ({ url, time }) => console.log(`fetched ${url} in ${time}ms`));
-
-for (const path of paths) {
-  const html = await crawler.get(path, { responseType: 'text' });
-  // ... extract data ...
+for (const url of urls) {
+  try {
+    const html = await api.get(url, { responseType: 'text' });
+    const titles = await api.scrape(url, '.article-title');
+    console.log(url, titles.length, 'titles');
+  } catch (error) {
+    console.error('skipping', url, error.code);
+  }
 }
 ```
 
-## Streaming a large file to disk
-
-Get a stream and pipe it to a file; report progress from the `data` chunks:
+## 5. Scrape a table and export to CSV
 
 ```js
-import fs from 'node:fs';
-import swiftly from 'swiftly';
+import { extractTables, toCSV } from 'swiftly';
 
-const api = swiftly();
-const stream = await api.get('https://example.com/big.zip', { stream: true, responseType: 'stream' });
-// `stream` is the raw Readable; its `.status`/`.headers` are available.
-
-let loaded = 0;
-const out = fs.createWriteStream('./big.zip');
-stream.on('data', (chunk) => { loaded += chunk.length; process.stdout.write(`\r${loaded} bytes`); });
-await new Promise((resolve, reject) => {
-  stream.pipe(out);
-  out.on('finish', resolve);
-  stream.on('error', reject);
-  out.on('error', reject);
+const html = await api.get('https://example.com/prices', {
+  responseType: 'text',
 });
+const [table] = extractTables(html);
+const csv = toCSV(table.rows);
 ```
 
-> For a `Buffer` in memory, prefer `api.download(url)` → `Buffer`.
-
-## Consuming Server-Sent Events
+## 6. Download a file with progress
 
 ```js
-const unsubscribe = await api.subscribe('https://example.com/stream', {
+await api.downloadTo(
+  'https://example.com/report.pdf',
+  '/tmp/report.pdf',
+  { onProgress: ({ loaded, total, percent }) => console.log(`${percent.toFixed(1)}%`) },
+);
+```
+
+## 7. Watch a GraphQL feed
+
+```js
+const data = await api.query('https://api.example.com/graphql', {
+  query: `{ recentPosts { id title } }`,
+});
+for (const post of data.recentPosts) console.log(post.title);
+```
+
+## 8. Live SSE stream
+
+```js
+const stop = await api.subscribe('https://api.example.com/events', {
   onOpen: () => console.log('connected'),
-  onMessage: (msg) => console.log('event:', msg.data),
-  onError: (err) => console.error('stream error', err),
+  onMessage: (msg) => {
+    if (msg.data) console.log(JSON.parse(msg.data));
+  },
 });
 
-// later:
-unsubscribe();
+setTimeout(stop, 60_000);
 ```
 
-`msg` is the parsed event: `{ id, event, data, retry }`. The promise rejects
-if the connection fails.
-
-## GraphQL with variables and errors
+## 9. Concurrency-safe cache-busting stock prices
 
 ```js
-try {
-  const data = await api.query('https://api.example.com/graphql', {
-    query: `
-      query Repo($owner: String!) {
-        repository(owner: $owner) { name }
-      }`,
-    variables: { owner: 'hiudy' },
-  });
-  console.log(data.repository.name);
-} catch (err) {
-  if (err.graphqlErrors) console.error('graphql:', err.graphqlErrors);
-  else throw err;
-}
+// Auth-aware + never stale: fetch fresh data for a SKU
+const stock = await api.get('/stock', {
+  params: { sku: 'A-1' },
+  cache: { enabled: false },
+});
 ```
 
-## Fan-out with batch
+## 10. Health-check monitor
 
-Fetch many resources in one concurrent call; handle partial failures:
+```js
+setInterval(async () => {
+  const started = Date.now();
+  try {
+    await api.get('/health');
+    console.log('OK', Date.now() - started, 'ms');
+  } catch (error) {
+    console.error('DOWN', error.code);
+  }
+}, 30_000);
+```
+
+## 11. Batch fan-out (never rejects)
 
 ```js
 const results = await api.batch(
-  ids.map((id) => ({ method: 'GET', url: `/users/${id}` }))
+  ids.map((id) => ({ method: 'GET', url: `/users/${id}` })),
 );
 
-const ok = results.filter((r) => !r.error);
-const failed = results.filter((r) => r.error);
-console.log(`got ${ok.length}, failed ${failed.length}`);
+const ok = results.filter((r) => !r.error).length;
+console.log(`${ok}/${ids.length} fetched`);
 ```
 
-## Cookie / session login flow
-
-Cookies from `Set-Cookie` are stored per domain and sent back automatically,
-including `Domain` (subdomains), `Path` and `Secure`:
+## 12. Request logging for every call
 
 ```js
-const api = swiftly();
+import swiftly, { events } from 'swiftly';
 
-await api.post('/login', { user: 'ana', pass: '***' }); // stores session cookie
-const dash = await api.get('/dashboard');               // cookie sent back
+swiftly.on(events.REQUEST_START, ({ method, url }) => console.log('→', method, url));
+swiftly.on(events.REQUEST_END, ({ method, url, status, time }) =>
+  console.log('←', status, `${time}ms`, url),
+);
+swiftly.on(events.REQUEST_ERROR, (error) => console.error('!', error.code, error.message));
 ```
 
-## Scraping pipeline
+## 13. Parse an RSS feed to items
 
 ```js
-import { parseHTML, extractTables } from 'swiftly';
+import { parseRSS } from 'swiftly';
 
-const html = await api.get('https://example.com/products', { responseType: 'text' });
-
-const { name, price } = parseHTML(html, {
-  name:  { selector: 'h1', type: 'text', multiple: false },
-  price: { selector: '.price', type: 'text', multiple: false },
+const xml = await api.get('https://feeds.example.com/rss', {
+  responseType: 'text',
 });
-
-const [specs] = extractTables(html);
-console.log(name, price, specs?.rows);
+for (const item of parseRSS(xml)) {
+  console.log(item.title, '->', item.link);
+}
 ```
 
-## CSV round-trip
+## 14. Type-check a JSON API response
 
 ```js
-import { parseCSV, toCSV } from 'swiftly';
-
-// API returns CSV text
-const csv = await api.get('/report.csv', { responseType: 'text' });
-const rows = parseCSV(csv);              // [{ date, value }, ...]
-
-// transform and write back
-const out = toCSV(rows.map((r) => ({ ...r, value: Number(r.value) * 2 })));
-await fs.promises.writeFile('./doubled.csv', out);
-```
-
-## Validating responses with `responseSchema`
-
-Fail fast when a response doesn't match your contract. `responseSchema` is a
-type map validated against the parsed JSON body:
-
-```js
-const api = swiftly({
-  responseSchema: { id: 'number', name: 'string' },
-});
-
-await api.get('/users/1'); // throws if `id`/`name` have the wrong type
-```
-
-
-## Monitoring with metrics and events
-
-Track cache hit-rate, slow requests, and breaker state in production:
-
-```js
-api.on('request:end', ({ url, time }) => {
-  if (time > 1000) console.warn(`slow: ${url} (${time}ms)`);
-});
-
-setInterval(() => {
-  const m = api.getMetrics();
-  console.log({
-    rps: m.requestCount,
-    hitRate: m.cacheHits / (m.cacheHits + m.cacheMisses || 1),
-    retries: m.retries,
-    breakers: m.circuitBreakers,
-  });
-}, 10_000);
-```
-
-## Custom transport or proxy
-
-```js
-// optional, faster HTTP engine (install `undici` separately)
-const fast = swiftly({ transport: 'undici' });
-
-// route through a proxy
-const proxied = swiftly({ proxy: { host: '127.0.0.1', port: 8080 } });
-```
-
-## Clean shutdown
-
-Release sockets and HTTP/2 sessions when your process exits:
-
-```js
-process.on('SIGINT', async () => {
-  await api.close();
-  process.exit(0);
+const user = await api.get('/users/1', {
+  responseSchema: { id: 'number', name: 'string', email: 'string' },
 });
 ```
+
+## 15. Timeout + abort control
+
+```js
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 800);
+
+try {
+  await api.get('/slow', { signal: controller.signal, timeouts: { connect: 1000, response: 5000 } });
+} catch (error) {
+  if (error.code === 'ABORT_ERROR') console.error('cancelled');
+  if (error.code === 'TIMEOUT_ERROR') console.error('slow', error.type);
+}
+```
+
+## Next steps
+
+- [Guides](guides/making-requests.md)
+- [Configuration](configuration/overview.md)
+- [Web scraping](scraping/html-parsing.md)
