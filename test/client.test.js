@@ -214,6 +214,15 @@ describe('client circuit breaker', () => {
         const body = await c.get(`${srv.url}/json`);
         expect(body.ok).toBe(true);
     });
+    it('opens after repeated 5xx server errors', async () => {
+        const c = mk({ retries: 1, circuitBreaker: { enabled: true, failureThreshold: 3, resetTimeout: 60000 } });
+        for (let i = 0; i < 3; i++) {
+            await expect(c.get(`${srv.url}/error500`)).rejects.toThrow();
+        }
+        const state = c.getMetrics().circuitBreakers.find(x => x.domain === '127.0.0.1');
+        expect(state.state.state).toBe('OPEN');
+        await expect(c.get(`${srv.url}/json`)).rejects.toBeInstanceOf(CircuitBreakerError);
+    });
 });
 
 describe('client cache', () => {
@@ -345,6 +354,14 @@ describe('client interceptors & hooks', () => {
         await c.get(`${srv.url}/json`);
         expect(onRequest).toHaveBeenCalled();
         expect(onResponse).toHaveBeenCalled();
+    });
+    it('response interceptor still runs on 5xx (no breaker)', async () => {
+        const c = mk();
+        let seen = null;
+        c.interceptors.response.use((res) => { seen = res; return res; });
+        await expect(c.get(`${srv.url}/error500`)).rejects.toBeInstanceOf(ResponseError);
+        expect(seen).not.toBeNull();
+        expect(seen.status).toBe(500);
     });
     it('onError hook is invoked on failure', async () => {
         const onError = vi.fn();

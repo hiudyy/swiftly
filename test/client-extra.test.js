@@ -8,7 +8,7 @@ import https from 'node:https';
 import { execSync } from 'node:child_process';
 import { createClient } from '../lib/client.js';
 import { startServer } from './helpers/server.js';
-import { TimeoutError } from '../lib/errors.js';
+import { TimeoutError, ResponseError } from '../lib/errors.js';
 
 let srv;
 
@@ -265,6 +265,11 @@ describe('client response validation', () => {
         const body = await c.get(`${srv.url}/json`, { responseSchema: {} });
         expect(body.ok).toBe(true);
     });
+    it('validates the parsed JSON body (not the raw buffer)', async () => {
+        const c = mk();
+        const body = await c.get(`${srv.url}/json`, { responseSchema: { ok: 'boolean' } });
+        expect(body.ok).toBe(true);
+    });
     it('throws when the schema does not match', async () => {
         const c = mk();
         await expect(c.get(`${srv.url}/json`, { responseSchema: { ok: 'string' } })).rejects.toThrow();
@@ -309,18 +314,20 @@ describe('client transport / ipv6 edges', () => {
 });
 
 describe('client SSE error paths', () => {
-    it('resolves with an unsubscribe fn even when the endpoint is not SSE', async () => {
+    it('rejects when the SSE endpoint is not 200', async () => {
         const c = mk();
-        const unsub = await c.subscribe(`${srv.url}/status/404`, { onMessage: () => {} });
-        expect(typeof unsub).toBe('function');
+        await expect(c.subscribe(`${srv.url}/status/404`, { onMessage: () => {} })).rejects.toBeTruthy();
     });
-    it('reports connection failures through onError', async () => {
+    it('rejects on connection failure and reports it through onError', async () => {
         const c = mk();
         let errCalled = false;
-        const unsub = await c.subscribe('http://127.0.0.1:1/sse', { onMessage: () => {}, onError: () => { errCalled = true; } });
-        expect(typeof unsub).toBe('function');
-        await new Promise((r) => setTimeout(r, 50));
+        await expect(c.subscribe('http://127.0.0.1:1/sse', { onMessage: () => {}, onError: () => { errCalled = true; } })).rejects.toBeTruthy();
         expect(errCalled).toBe(true);
+    });
+    it('resolves with an unsubscribe fn once the stream is open', async () => {
+        const c = mk();
+        const unsub = await c.subscribe(`${srv.url}/sse`, { onMessage: () => {} });
+        expect(typeof unsub).toBe('function');
     });
 });
 
@@ -497,6 +504,12 @@ describe('client config helpers', () => {
         const buf = await c.download(`${srv.url}/big`);
         expect(Buffer.isBuffer(buf)).toBe(true);
         expect(buf.length).toBe(100000);
+    });
+    it('rejects downloadTo when the response is an error status', async () => {
+        const c = mk();
+        const file = path.join(os.tmpdir(), `swiftly-fail-${Date.now()}.bin`);
+        await expect(c.downloadTo(`${srv.url}/status/404`, file)).rejects.toBeInstanceOf(ResponseError);
+        expect(fs.existsSync(file)).toBe(false);
     });
     it('closes the client without throwing', async () => {
         const c = mk();
