@@ -2444,7 +2444,7 @@ var NAMED_ENTITIES = {
   eacute: "\xE9",
   iacute: "\xED"
 };
-var ENTITY_RE = /&(#x?[0-9a-fA-F]+|[a-zA-Z0-9]+);/g;
+var ENTITY_RE = /&(#[xX]?[0-9a-fA-F]+|[a-zA-Z0-9]+);/g;
 function decodeEntities(text) {
   if (!text || !text.includes("&")) return text;
   return text.replace(ENTITY_RE, (match, entity) => {
@@ -2501,19 +2501,31 @@ function tokenize(html) {
     }
     if (lt > i) tokens.push({ type: "text", text: html.slice(i, lt) });
     const after = html[lt + 1];
-    if (after === "!") {
+    if (after === void 0) {
+      tokens.push({ type: "text", text: "<" });
+      i = lt + 1;
+      continue;
+    }
+    if (after === "!" || after === "?") {
       const end = html.indexOf(">", lt);
       if (end === -1) break;
       const inner = html.slice(lt + 2, end).trim().toLowerCase();
-      tokens.push({ type: inner.startsWith("--") ? "comment" : "doctype", raw: html.slice(lt, end + 1) });
-      i = end + 1;
+      if (inner.startsWith("--")) {
+        const cend = html.indexOf("-->", lt + 3);
+        const stop = cend === -1 ? end : cend + 2;
+        tokens.push({ type: "comment", raw: html.slice(lt, stop + 1) });
+        i = stop + 1;
+      } else {
+        tokens.push({ type: "doctype", raw: html.slice(lt, end + 1) });
+        i = end + 1;
+      }
     } else if (after === "/") {
       const end = html.indexOf(">", lt);
       if (end === -1) break;
       const name = html.slice(lt + 2, end).trim().split(/\s+/)[0].toLowerCase();
       tokens.push({ type: "close", name, raw: html.slice(lt, end + 1) });
       i = end + 1;
-    } else if (after !== void 0) {
+    } else if (/[a-zA-Z]/.test(after)) {
       const end = findTagEnd(html, lt);
       if (end === -1) break;
       const raw = html.slice(lt, end + 1);
@@ -2537,7 +2549,8 @@ function tokenize(html) {
         continue;
       }
     } else {
-      break;
+      tokens.push({ type: "text", text: "<" });
+      i = lt + 1;
     }
   }
   return tokens;
@@ -2616,11 +2629,14 @@ function applyImpliedCloses(stack, tag) {
   }
 }
 function buildTree(tokens) {
-  const root = { tag: "#root", attrs: {}, children: [], parent: null, text: "", index: 0, typeIndex: 0, selfClosing: false, raw: "" };
+  const root = { tag: "#root", attrs: {}, children: [], parent: null, text: "", index: 0, typeIndex: 0, selfClosing: false, raw: "", parts: [] };
   const stack = [root];
   for (const tok of tokens) {
     if (tok.type === "text") {
-      stack[stack.length - 1].text += tok.text;
+      const text = decodeEntities(tok.text);
+      const top = stack[stack.length - 1];
+      top.text += text;
+      top.parts.push({ kind: "text", text });
       continue;
     }
     if (tok.type === "comment" || tok.type === "doctype") continue;
@@ -2635,6 +2651,7 @@ function buildTree(tokens) {
     }
     applyImpliedCloses(stack, tok.name);
     const parent = stack[stack.length - 1];
+    const isVoid = VOID_TAGS.has(tok.name);
     const node = {
       tag: tok.name,
       attrs: tok.attrs,
@@ -2643,11 +2660,13 @@ function buildTree(tokens) {
       text: "",
       index: 0,
       typeIndex: 0,
-      selfClosing: tok.selfClosing,
-      raw: tok.raw
+      selfClosing: isVoid,
+      raw: tok.raw,
+      parts: []
     };
     parent.children.push(node);
-    if (!tok.selfClosing) stack.push(node);
+    parent.parts.push({ kind: "el", node });
+    if (!isVoid) stack.push(node);
   }
   assignIndices(root);
   return root;
@@ -2666,17 +2685,24 @@ function assignIndices(node) {
   }
 }
 function elementText(node) {
-  let out = node.text;
-  for (const c of node.children) {
-    if (c.tag === "script" || c.tag === "style" || c.tag === "noscript") continue;
-    out += elementText(c);
+  let out = "";
+  for (const part of node.parts) {
+    if (part.kind === "text") {
+      out += part.text;
+    } else {
+      const c = part.node;
+      if (c.tag === "script" || c.tag === "style" || c.tag === "noscript") continue;
+      out += elementText(c);
+    }
   }
   return out;
 }
 function outerHTML(node) {
   if (node.selfClosing) return node.raw;
-  let out = node.raw + node.text;
-  for (const c of node.children) out += outerHTML(c);
+  let out = node.raw;
+  for (const part of node.parts) {
+    out += part.kind === "text" ? part.text : outerHTML(part.node);
+  }
   out += `</${node.tag}>`;
   return out;
 }
@@ -3114,6 +3140,10 @@ function createParser(doc) {
     document: doc
   };
 }
+function extractDocumentText(html) {
+  const source = Buffer.isBuffer(html) ? html.toString("utf-8") : String(html);
+  return elementText(buildTree(tokenize(source))).replace(/\s+/g, " ").trim();
+}
 function parseHTML(html, selectors, options = {}) {
   if (Buffer.isBuffer(html)) {
     html = html.toString("utf-8");
@@ -3139,10 +3169,10 @@ function parseHTML(html, selectors, options = {}) {
     const results = {};
     for (const [key, config] of Object.entries(selectors)) {
       if (typeof config === "string") {
-        const attrMatch = config.match(/^(.+)@(\w+)$/);
-        if (attrMatch) {
+        const attrMatch = config.match(/^(.*)@([^@]+)$/);
+        if (attrMatch && attrMatch[1].trim()) {
           const [, sel, attr] = attrMatch;
-          results[key] = parser.querySelectorAll(sel).map((el) => el.attr(attr));
+          results[key] = parser.querySelectorAll(sel.trim()).map((el) => el.attr(attr.trim()));
         } else {
           results[key] = parser.querySelectorAll(config);
         }
@@ -3221,10 +3251,7 @@ function extractImages(html, baseUrl = null) {
   return out;
 }
 function extractText(html) {
-  const source = Buffer.isBuffer(html) ? html.toString("utf-8") : String(html);
-  return decodeEntities(
-    source.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<noscript[\s\S]*?<\/noscript>/gi, " ").replace(/<!--[\s\S]*?-->/g, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
-  );
+  return extractDocumentText(html);
 }
 function extractMeta(html) {
   const meta = {};
