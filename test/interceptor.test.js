@@ -151,4 +151,32 @@ describe('CookieJar', () => {
         expect(() => jar.setCookie('example.com', '=value')).not.toThrow();
         expect(jar.getCookies('example.com')).toBe('');
     });
+    it('shares a Domain cookie across subdomains', () => {
+        const jar = createCookieJar();
+        jar.setCookie('api.example.com', 'sid=abc; Domain=example.com; Path=/');
+        // stored under the domain attribute, matched by subdomain
+        expect(jar.getCookies('https://api.example.com/')).toBe('sid=abc');
+        expect(jar.getCookies('https://www.example.com/')).toBe('sid=abc');
+        // not leaked to an unrelated domain
+        expect(jar.getCookies('https://otherexample.com/')).toBe('');
+        expect(jar.getCookies('https://xexample.com/')).toBe('');
+    });
+    it('host-only cookie is NOT sent to subdomains', () => {
+        const jar = createCookieJar();
+        jar.setCookie('api.example.com', 'sid=abc; Path=/');
+        expect(jar.getCookies('https://api.example.com/')).toBe('sid=abc');
+        expect(jar.getCookies('https://www.example.com/')).toBe('');
+    });
+    it('respects Path', () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Path=/admin');
+        expect(jar.getCookies('https://example.com/admin')).toBe('sid=abc');
+        expect(jar.getCookies('https://example.com/public')).toBe('');
+    });
+    it('omits Secure cookies on non-HTTPS requests', () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Secure; Path=/');
+        expect(jar.getCookies('https://example.com/')).toBe('sid=abc');
+        expect(jar.getCookies('http://example.com/')).toBe('');
+    });
 });
