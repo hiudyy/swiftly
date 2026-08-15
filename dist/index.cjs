@@ -2141,7 +2141,9 @@ var HTTPClient = class _HTTPClient {
     };
     return new Promise((resolve, reject) => {
       const client = urlObj.protocol === "https:" ? import_node_https2.default : import_node_http2.default;
-      const req = client.request(urlObj, options, (res) => {
+      const reqOptions = { ...options };
+      if (typeof reqOptions.timeout !== "number") delete reqOptions.timeout;
+      const req = client.request(urlObj, reqOptions, (res) => {
         if (res.statusCode !== 200) {
           reject(new Error(`SSE connection failed: ${res.statusCode}`));
           return;
@@ -3668,7 +3670,7 @@ var swiftly = (config = {}) => {
     client.config.baseURL = url;
   };
   instance.setDefaultHeaders = (headers) => {
-    Object.assign(client.config.headers || {}, headers);
+    client.config.headers = { ...client.config.headers || {}, ...headers };
   };
   instance.setTimeout = (timeout) => {
     client.config.timeout = timeout;

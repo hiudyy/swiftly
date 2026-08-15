@@ -1,41 +1,71 @@
 import { describe, it, expect } from 'vitest';
 import { parseHTML } from '../lib/scraper.js';
 
-const HTML = `<!DOCTYPE html><html><body>
-<div class="card"><h1 id="title">Hello</h1></div>
-<div class="card"><h1>World</h1></div>
-<a href="https://example.com/link">Go</a>
-</body></html>`;
+describe('scraper object selectors & edge cases', () => {
+    const DOC = `<!DOCTYPE html><html><head><title>T</title></head><body>
+    <ul id="list">
+      <li class="item first" data-id="1">One</li>
+      <li class="item" data-id="2">Two</li>
+      <li class="item last" data-id="3">Three</li>
+    </ul>
+    <a href="https://a.example" class="btn">A</a>
+    <a href="https://b.example" class="btn" target="_blank">B</a>
+    <p><em>hello</em> world &amp; beyond</p>
+    <script>if (a < b && c > d) { run(); }</script>
+    </body></html>`;
 
-describe('scraper', () => {
     it('querySelectorAll by class', () => {
-        const els = parseHTML(HTML, '.card');
-        expect(els.length).toBe(2);
-        expect(els[0].content).toContain('Hello');
+        expect(parseHTML(DOC, 'li.item').length).toBe(3);
     });
-
     it('querySelectorAll by tag', () => {
-        const els = parseHTML(HTML, 'h1');
-        expect(els.length).toBe(2);
+        expect(parseHTML(DOC, 'li').length).toBe(3);
+        expect(parseHTML(DOC, 'a').length).toBe(2);
     });
-
-    it('handles object selectors with attribute extraction', () => {
-        const out = parseHTML(HTML, { links: 'a@href' });
-        expect(out.links).toEqual(['https://example.com/link']);
+    it('handles object selectors with attribute extraction shorthand', () => {
+        const out = parseHTML(DOC, { links: 'a@href' });
+        expect(out.links).toEqual(['https://a.example', 'https://b.example']);
     });
-
     it('handles config object with type attr and multiple', () => {
-        const out = parseHTML(HTML, {
-            title: { selector: '#title', type: 'text', multiple: false }
-        });
-        expect(out.title).toContain('Hello');
+        const out = parseHTML(DOC, { names: { selector: 'li.item', type: 'text', multiple: true } });
+        expect(out.names).toEqual(['One', 'Two', 'Three']);
     });
-
     it('returns nulls for empty html with object selectors', () => {
-        expect(parseHTML('', { a: '.x' })).toEqual({ a: null });
+        const out = parseHTML('', { a: 'div', b: { selector: 'x', type: 'text' } });
+        expect(out.a).toBeNull();
+        expect(out.b).toBeNull();
     });
-
     it('throws on non-string html', () => {
-        expect(() => parseHTML(null, '.x')).toThrow();
+        expect(() => parseHTML(123)).toThrow();
+    });
+    it('object selector string returns element arrays', () => {
+        const out = parseHTML(DOC, { items: 'li.item' });
+        expect(Array.isArray(out.items)).toBe(true);
+        expect(out.items.length).toBe(3);
+    });
+    it('object selector with type html', () => {
+        const out = parseHTML(DOC, { firstLi: { selector: 'li.item', type: 'html', multiple: false } });
+        expect(out.firstLi).toContain('One');
+    });
+    it('object selector with type attr and multiple false', () => {
+        const out = parseHTML(DOC, { firstId: { selector: 'li.item', type: 'attr', attr: 'data-id', multiple: false } });
+        expect(out.firstId).toBe('1');
+    });
+    it('object selector multiple false returns null when empty', () => {
+        const out = parseHTML(DOC, { missing: { selector: 'li.nope', type: 'text', multiple: false } });
+        expect(out.missing).toBeNull();
+    });
+    it('handles Buffer input', () => {
+        const out = parseHTML(Buffer.from('<p>hi</p>'), 'p');
+        expect(out.length).toBe(1);
+        expect(out[0].content).toBe('hi');
+    });
+    it('handles whitespace-only html', () => {
+        expect(parseHTML('   ', 'div')).toEqual([]);
+    });
+    it('array selector returns array of arrays', () => {
+        const out = parseHTML(DOC, ['li.item', 'a.btn']);
+        expect(out.length).toBe(2);
+        expect(out[0].length).toBe(3);
+        expect(out[1].length).toBe(2);
     });
 });

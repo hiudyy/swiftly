@@ -75,7 +75,7 @@ const swiftly = (config = {}) => {
 
     instance.setBaseURL = (url) => { client.config.baseURL = url; };
     instance.setDefaultHeaders = (headers) => {
-        Object.assign(client.config.headers || {}, headers);
+        client.config.headers = { ...(client.config.headers || {}), ...headers };
     };
     instance.setTimeout = (timeout) => { client.config.timeout = timeout; };
     instance.setDebug = (debug) => { client.config.debug = debug; };
