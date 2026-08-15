@@ -679,7 +679,10 @@ describe('user journey: events, metrics and debugging', () => {
         expect(m.requestCount).toBe(1);
         expect(m.cacheHits).toBe(1);
         expect(m.cacheMisses).toBe(1);
-        expect(m.averageResponseTime).toBeGreaterThan(0);
+        // a local request can complete in the same millisecond it starts, so
+        // the average may legitimately be 0 — it must still be a finite number
+        expect(Number.isFinite(m.averageResponseTime)).toBe(true);
+        expect(m.averageResponseTime).toBeGreaterThanOrEqual(0);
         expect(m.totalDataTransferred).toBeGreaterThan(0);
     });
 
