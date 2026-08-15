@@ -62,6 +62,22 @@ describe('scraper object selectors & edge cases', () => {
     it('handles whitespace-only html', () => {
         expect(parseHTML('   ', 'div')).toEqual([]);
     });
+    it('applies implied end tags (li/p close siblings)', () => {
+        const html = '<ul><li>A<li>B<li>C</ul><p>Hello<p>World</p>';
+        const out = parseHTML(html, { items: { selector: 'li', type: 'text' }, paras: { selector: 'p', type: 'text' } });
+        expect(out.items).toEqual(['A', 'B', 'C']);
+        expect(out.paras).toEqual(['Hello', 'World']);
+    });
+    it('applies implied end tags for table cells', () => {
+        const out = parseHTML('<table><tr><td>A<td>B</tr><tr><td>C</table>', 'td');
+        expect(out.map(e => e.text())).toEqual(['A', 'B', 'C']);
+        expect(out[1].parent().tag).toBe('tr');
+    });
+    it('a block element closes an open p', () => {
+        const out = parseHTML('<p>one<div>two', { p: { selector: 'p', type: 'text' }, div: { selector: 'div', type: 'text' } });
+        expect(out.p).toEqual(['one']);
+        expect(out.div).toEqual(['two']);
+    });
     it('array selector returns array of arrays', () => {
         const out = parseHTML(DOC, ['li.item', 'a.btn']);
         expect(out.length).toBe(2);

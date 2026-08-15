@@ -2600,6 +2600,79 @@ function tokenize(html) {
   }
   return tokens;
 }
+var AUTO_CLOSE = {
+  li: ["li"],
+  dt: ["dt", "dd"],
+  dd: ["dt", "dd"],
+  p: ["p"],
+  rt: ["rt", "rp"],
+  rp: ["rt", "rp"],
+  optgroup: ["optgroup"],
+  option: ["option", "optgroup"],
+  caption: ["caption"],
+  colgroup: ["colgroup"],
+  thead: ["thead", "tbody", "tfoot"],
+  tbody: ["thead", "tbody", "tfoot"],
+  tfoot: ["thead", "tbody", "tfoot"],
+  tr: ["tr", "tbody", "thead", "tfoot"],
+  td: ["td", "th"],
+  th: ["td", "th"]
+};
+var CLOSES_P = /* @__PURE__ */ new Set([
+  "address",
+  "article",
+  "aside",
+  "blockquote",
+  "center",
+  "details",
+  "dialog",
+  "dir",
+  "div",
+  "dl",
+  "fieldset",
+  "figcaption",
+  "figure",
+  "footer",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "header",
+  "hgroup",
+  "hr",
+  "main",
+  "menu",
+  "nav",
+  "ol",
+  "p",
+  "pre",
+  "section",
+  "summary",
+  "table",
+  "ul"
+]);
+function applyImpliedCloses(stack, tag) {
+  const closers = AUTO_CLOSE[tag];
+  if (closers) {
+    for (let k = stack.length - 1; k >= 1; k--) {
+      if (closers.includes(stack[k].tag)) {
+        stack.length = k;
+        return;
+      }
+    }
+  }
+  if (CLOSES_P.has(tag)) {
+    for (let k = stack.length - 1; k >= 1; k--) {
+      if (stack[k].tag === "p") {
+        stack.length = k;
+        return;
+      }
+    }
+  }
+}
 function buildTree(tokens) {
   const root = { tag: "#root", attrs: {}, children: [], parent: null, text: "", index: 0, typeIndex: 0, selfClosing: false, raw: "" };
   const stack = [root];
@@ -2618,6 +2691,7 @@ function buildTree(tokens) {
       }
       continue;
     }
+    applyImpliedCloses(stack, tok.name);
     const parent = stack[stack.length - 1];
     const node = {
       tag: tok.name,
