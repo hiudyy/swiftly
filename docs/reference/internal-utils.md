@@ -12,7 +12,7 @@ need them. Not part of the stable API — but documented for completeness.
 |----------|-----------|----------|
 | `detectResponseType(contentType)` | `(string) => 'json' \| 'html' \| 'text' \| 'buffer'` | Lowercased checks: `application/json` → json, `text/html` → html, `text/` → text, else buffer. |
 | `delay(ms, signal?)` | `(number, AbortSignal?) => Promise<void>` | Wait; rejects with `Error('Aborted')` if the signal aborts. |
-| `buildQueryString(params)` | `(object) => string` | `querystring.stringify`; nested objects JSON-stringified. |
+| `buildQueryString(params)` | `(object) => string` | `querystring.stringify`; arrays become repeated keys (`tags=a&tags=b`), nested plain objects JSON-stringified. |
 | `isValidUrl(string)` | `(string) => boolean` | `new URL()` parses without throwing. |
 | `deepMerge(target, source)` | `(object, object) => object` | Immutable deep merge (arrays replace). |
 | `parseUrl(url)` | `(string) => { protocol, hostname, port, pathname, search, hash, params } \| null` | Parsed URL plus `params` map; `null` if invalid. |

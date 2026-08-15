@@ -63,7 +63,7 @@ var delay = (ms, signal = null) => new Promise((resolve, reject) => {
 var buildQueryString = (params) => {
   const normalized = {};
   for (const [key, value] of Object.entries(params || {})) {
-    if (value !== null && typeof value === "object" && !(value instanceof Date)) {
+    if (value !== null && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
       normalized[key] = JSON.stringify(value);
     } else {
       normalized[key] = value;
@@ -719,1741 +719,6 @@ function destroyAgents(pool) {
   }
   pool.clear();
 }
-
-// lib/errors.js
-var SwiftlyError = class extends Error {
-  constructor(message, code, context = {}) {
-    super(message);
-    this.name = "SwiftlyError";
-    this.code = code;
-    this.context = context;
-  }
-};
-var ValidationError = class extends SwiftlyError {
-  constructor(message, context = {}) {
-    super(message, "VALIDATION_ERROR", context);
-    this.name = "ValidationError";
-  }
-};
-var RequestError = class extends SwiftlyError {
-  constructor(message, context = {}) {
-    super(message, "REQUEST_ERROR", context);
-    this.name = "RequestError";
-  }
-};
-var ResponseError = class extends SwiftlyError {
-  constructor(message, response, context = {}) {
-    super(message, "RESPONSE_ERROR", { response, ...context });
-    this.name = "ResponseError";
-    this.response = response;
-  }
-};
-var CircuitBreakerError = class extends SwiftlyError {
-  constructor(message, domain, context = {}) {
-    super(message, "CIRCUIT_BREAKER_ERROR", { domain, ...context });
-    this.name = "CircuitBreakerError";
-    this.domain = domain;
-  }
-};
-var TimeoutError = class extends SwiftlyError {
-  constructor(message, type, context = {}) {
-    super(message, "TIMEOUT_ERROR", { type, ...context });
-    this.name = "TimeoutError";
-    this.type = type;
-  }
-};
-var AbortError = class extends SwiftlyError {
-  constructor(message = "Request aborted", context = {}) {
-    super(message, "ABORT_ERROR", context);
-    this.name = "AbortError";
-  }
-};
-
-// lib/client.js
-var undiciRequestFn = null;
-var undiciLoading = null;
-async function loadUndici() {
-  if (undiciRequestFn) return undiciRequestFn;
-  if (!undiciLoading) {
-    undiciLoading = import("undici").then((mod) => {
-      undiciRequestFn = mod.request;
-      return undiciRequestFn;
-    }).catch((e) => {
-      undiciLoading = null;
-      throw e;
-    });
-  }
-  return undiciLoading;
-}
-var VALID_METHODS = Object.freeze({
-  GET: true,
-  POST: true,
-  PUT: true,
-  DELETE: true,
-  PATCH: true,
-  HEAD: true,
-  OPTIONS: true
-});
-var CircuitBreaker = class {
-  constructor(config = {}) {
-    this.state = "CLOSED";
-    this.failureCount = 0;
-    this.lastFailureTime = null;
-    this.config = {
-      failureThreshold: 5,
-      resetTimeout: 6e4,
-      // 1 minuto
-      ...config
-    };
-    this.events = createEventEmitter();
-    this.halfOpenTrialInFlight = false;
-  }
-  async execute(command, domain) {
-    if (this.state === "OPEN") {
-      if (Date.now() - this.lastFailureTime > this.config.resetTimeout) {
-        this.state = "HALF-OPEN";
-        this.halfOpenTrialInFlight = false;
-        this.events.emit("circuit:half-open", { domain });
-      } else {
-        this.events.emit("circuit:rejected", { domain, state: this.state });
-        throw new CircuitBreakerError("Circuit breaker is OPEN", domain);
-      }
-    }
-    if (this.state === "HALF-OPEN") {
-      if (this.halfOpenTrialInFlight) {
-        this.events.emit("circuit:rejected", { domain, state: this.state });
-        throw new CircuitBreakerError("Circuit breaker is HALF-OPEN (trial request in flight)", domain);
-      }
-      this.halfOpenTrialInFlight = true;
-    }
-    try {
-      const result = await command();
-      if (this.state === "HALF-OPEN") {
-        this.state = "CLOSED";
-        this.failureCount = 0;
-        this.halfOpenTrialInFlight = false;
-        this.events.emit("circuit:close", { domain });
-      }
-      return result;
-    } catch (error) {
-      if (this.state === "HALF-OPEN") {
-        this.state = "OPEN";
-        this.halfOpenTrialInFlight = false;
-        this.lastFailureTime = Date.now();
-        this.events.emit("circuit:open", {
-          domain,
-          failureCount: this.failureCount,
-          resetTimeout: this.config.resetTimeout
-        });
-      } else {
-        this.handleFailure(domain);
-      }
-      throw error;
-    }
-  }
-  handleFailure(domain) {
-    this.failureCount++;
-    this.lastFailureTime = Date.now();
-    if (this.failureCount >= this.config.failureThreshold) {
-      this.state = "OPEN";
-      this.events.emit("circuit:open", {
-        domain,
-        failureCount: this.failureCount,
-        resetTimeout: this.config.resetTimeout
-      });
-    }
-  }
-  getState() {
-    return {
-      state: this.state,
-      failureCount: this.failureCount,
-      lastFailureTime: this.lastFailureTime
-    };
-  }
-};
-var HTTPClient = class _HTTPClient {
-  constructor(config = {}) {
-    this.config = {
-      // Socket timeout is OPT-IN (perf-first, like axios's default of 0):
-      // no per-request timer is created unless `timeout` is set.
-      timeout: null,
-      retries: 3,
-      retryDelay: 1e3,
-      humanize: false,
-      // Performance-first: no artificial delay
-      followRedirects: true,
-      maxRedirects: 5,
-      validateSSL: true,
-      useHttp2: false,
-      debug: false,
-      // Silent by default
-      randomizeHeaders: false,
-      cache: {
-        enabled: true,
-        ttl: 3e5,
-        // 5 minutos
-        maxSize: 1e3
-      },
-      rateLimiting: {
-        enabled: false,
-        // Performance-first: no throttle by default
-        requestsPerSecond: 2,
-        maxDelay: 64e3,
-        minDelay: 1e3
-      },
-      compression: {
-        request: true,
-        response: true,
-        minSize: 1024,
-        // Min bytes to gzip request payload
-        responseMinSize: 0
-        // Min bytes to decompress response
-      },
-      // Timer-based timeouts are OPT-IN (perf-first): `config.timeout`
-      // still guards the socket natively, but the connect/response/idle
-      // timers only run when `timeouts` is explicitly configured.
-      timeouts: null,
-      session: {
-        ttl: 36e5,
-        // 1 hora
-        maxSessions: 100,
-        autoCleanup: true
-      },
-      circuitBreaker: {
-        enabled: false,
-        // Desabilitado por padrão - ativar manualmente
-        failureThreshold: 5,
-        resetTimeout: 6e4
-      },
-      proxy: null,
-      // Proxy configuration { host, port, auth? }
-      baseURL: null,
-      // Base URL for all requests
-      responseEncoding: "utf-8",
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      decompress: true,
-      // Connection pooling (keep-alive Agents per origin)
-      keepAlive: true,
-      maxSockets: Infinity,
-      maxFreeSockets: 256,
-      agent: null,
-      // custom http.Agent / https.Agent override
-      // Auth helpers
-      auth: null,
-      // { username, password } -> Basic auth
-      bearer: null,
-      // -> Authorization: Bearer <token>
-      token: null,
-      // -> Authorization: <token>
-      // Retry refinements
-      retryOn: null,
-      // number[], or (error) => boolean
-      retryBackoff: null,
-      // exponential factor (>=1); default: linear
-      retryJitter: false,
-      // adds randomized jitter to backoff
-      maxRetryAfter: 6e4,
-      // cap for Retry-After honored delay
-      onRetry: null,
-      // (attempt, error, delay) => void
-      // Hooks (informational)
-      onRequest: null,
-      onResponse: null,
-      onError: null,
-      onDownloadProgress: null,
-      onUploadProgress: null,
-      // Streaming
-      stream: false,
-      // Transport: 'http' (default) | 'undici' (optional, lazy-loaded)
-      transport: "http",
-      ...config
-    };
-    this.events = createEventEmitter();
-    this.interceptors = {
-      request: createInterceptorManager(),
-      response: createInterceptorManager()
-    };
-    this.cookieJar = createCookieJar();
-    this.rateLimiter = createRateLimiter(this.config.rateLimiting);
-    this.cache = createCacheStore(this.config.cache);
-    this.connectionPool = /* @__PURE__ */ new Map();
-    this.http2Sessions = /* @__PURE__ */ new Map();
-    this.sessions = /* @__PURE__ */ new Map();
-    this.sessionConfig = this.config.session;
-    this.responseTransformers = /* @__PURE__ */ new Map();
-    this.responseValidators = /* @__PURE__ */ new Map();
-    this.circuitBreakers = /* @__PURE__ */ new Map();
-    this.routeMetrics = /* @__PURE__ */ new Map();
-    this._refreshing = /* @__PURE__ */ new Set();
-    this.pendingRequests = /* @__PURE__ */ new Map();
-    this._mergeCache = /* @__PURE__ */ new WeakMap();
-    this._urlCache = /* @__PURE__ */ new Map();
-    this.metrics = {
-      requestCount: 0,
-      totalTime: 0,
-      cacheHits: 0,
-      cacheMisses: 0,
-      retries: 0,
-      successCount: 0,
-      errorCount: 0,
-      averageResponseTime: 0,
-      lastRequestTime: 0,
-      totalDataTransferred: 0,
-      http2Requests: 0,
-      redirects: 0,
-      activeSessions: 0,
-      pooledConnections: 0,
-      routeTimes: /* @__PURE__ */ new Map()
-      //Added for route response times
-    };
-    this.pendingRequests = /* @__PURE__ */ new Map();
-    this._registerDefaultTransformers();
-    this._registerDefaultValidators();
-    this._cleanupInterval = null;
-    if (this.config.session.autoCleanup) {
-      this._cleanupInterval = setInterval(() => this._cleanupSessions(), this.config.session.ttl);
-      if (this._cleanupInterval.unref) {
-        this._cleanupInterval.unref();
-      }
-    }
-  }
-  // Método auxiliar para logs melhorado
-  _log(level, ...args) {
-    if (!this.config.debug) return;
-    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-    switch (level) {
-      case "error":
-        console.error(`[Swiftly ${timestamp}]`, ...args);
-        break;
-      case "info":
-        console.info(`[Swiftly ${timestamp}]`, ...args);
-        break;
-      case "debug":
-        console.log(`[Swiftly ${timestamp}]`, ...args);
-        break;
-    }
-  }
-  // Validação de parâmetros
-  _validateRequestParams(method, url, data = null, config = {}) {
-    if (typeof method === "string" && VALID_METHODS[method] && typeof url === "string" && url.charCodeAt(0) === 104 && // 'h' — http(s):// absolute URL
-    (data === null || typeof data === "object" || typeof data === "string") && (config === void 0 || config === null || typeof config === "object") && !(config && config.headers)) {
-      return;
-    }
-    const errors = [];
-    if (!method || typeof method !== "string") {
-      errors.push("Method is required and must be a string");
-    }
-    if (!url) {
-      errors.push("URL is required");
-    } else if (typeof url !== "string") {
-      errors.push("URL must be a string");
-    } else {
-      const isRelativeUrl = url.startsWith("/") || !url.includes("://");
-      const hasBaseURL = this.config && this.config.baseURL;
-      if (isRelativeUrl && !hasBaseURL) {
-        errors.push(`Relative URL "${url}" requires baseURL to be configured`);
-      }
-    }
-    if (data !== null) {
-      if (typeof data !== "object" && typeof data !== "string") {
-        errors.push("Data must be an object, string or null");
-      }
-      if (typeof data === "object" && !Array.isArray(data) && data.constructor !== Object && !(data instanceof Buffer)) {
-        errors.push("Data object must be a plain object, array or Buffer");
-      }
-    }
-    if (config && typeof config !== "object") {
-      errors.push("Config must be an object");
-    }
-    if (config && config.headers) {
-      if (typeof config.headers !== "object") {
-        errors.push("Headers must be an object");
-      } else {
-        for (const [key, value] of Object.entries(config.headers)) {
-          if (typeof value !== "string" && typeof value !== "number") {
-            errors.push(`Header "${key}" must be a string or number, got ${typeof value}`);
-          }
-        }
-      }
-    }
-    if (!VALID_METHODS[method.toUpperCase()]) {
-      errors.push(`Invalid method: ${method}. Valid methods are: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS`);
-    }
-    if (errors.length > 0) {
-      throw new ValidationError(`Validation failed:
-- ${errors.join("\n- ")}`, {
-        method,
-        url,
-        data,
-        config
-      });
-    }
-  }
-  // Método auxiliar para formatar URL
-  _formatUrl(url, params) {
-    if (!this.config.baseURL && !params) {
-      return url;
-    }
-    try {
-      let fullUrl = url;
-      if (this.config.baseURL && !url.includes("://")) {
-        const base = this.config.baseURL.replace(/\/$/, "");
-        const path = url.startsWith("/") ? url : "/" + url;
-        fullUrl = base + path;
-      }
-      const urlObj = new URL(fullUrl);
-      if (params) {
-        const qs = buildQueryString(params);
-        if (qs) {
-          urlObj.search = urlObj.search ? `${urlObj.search}&${qs}` : `?${qs}`;
-        }
-      }
-      return urlObj.toString();
-    } catch (error) {
-      throw new Error(`Invalid URL: ${url}`);
-    }
-  }
-  // Compute an auth identity string used to vary the cache AND dedup keys,
-  // so that responses for different credentials are never shared (prevents
-  // leaking one user's response to another on the same endpoint). Covers the
-  // auth helpers, an explicit Authorization header and a per-request Cookie
-  // header (jar cookies are client-global, so they cannot vary per request).
-  _authVary(config) {
-    const parts = [
-      config.headers && config.headers["Authorization"],
-      config.headers && config.headers["Cookie"],
-      config.auth && config.auth.username,
-      config.auth && config.auth.password,
-      config.bearer,
-      config.token
-    ];
-    return parts.filter(Boolean).join("|");
-  }
-  // Métodos HTTP melhorados
-  async get(url, config = {}) {
-    this._validateRequestParams("GET", url, null, config);
-    this._log("info", `GET request to ${url}`);
-    return this.request("GET", url, null, config).catch((error) => {
-      this._log("error", `GET request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async post(url, data = null, config = {}) {
-    this._validateRequestParams("POST", url, data, config);
-    this._log("info", `POST request to ${url}`);
-    if (config.formData && !data) {
-      throw new ValidationError("Form data is required when formData option is enabled");
-    }
-    return this.request("POST", url, data, config).catch((error) => {
-      this._log("error", `POST request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async put(url, data = null, config = {}) {
-    this._validateRequestParams("PUT", url, data, config);
-    this._log("info", `PUT request to ${url}`);
-    return this.request("PUT", url, data, config).catch((error) => {
-      this._log("error", `PUT request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async delete(url, config = {}) {
-    this._validateRequestParams("DELETE", url, null, config);
-    this._log("info", `DELETE request to ${url}`);
-    return this.request("DELETE", url, null, config).catch((error) => {
-      this._log("error", `DELETE request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async patch(url, data = null, config = {}) {
-    this._validateRequestParams("PATCH", url, data, config);
-    this._log("info", `PATCH request to ${url}`);
-    return this.request("PATCH", url, data, config).catch((error) => {
-      this._log("error", `PATCH request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async head(url, config = {}) {
-    this._validateRequestParams("HEAD", url, null, config);
-    this._log("info", `HEAD request to ${url}`);
-    return this.request("HEAD", url, null, config).catch((error) => {
-      this._log("error", `HEAD request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  async options(url, config = {}) {
-    this._validateRequestParams("OPTIONS", url, null, config);
-    this._log("info", `OPTIONS request to ${url}`);
-    return this.request("OPTIONS", url, null, config).catch((error) => {
-      this._log("error", `OPTIONS request failed: ${error.message}`);
-      throw error;
-    });
-  }
-  _registerDefaultTransformers() {
-    this.responseTransformers.set("json", (data) => {
-      try {
-        const text = data.toString("utf-8");
-        if (!text.length) {
-          throw new Error("Empty response body");
-        }
-        if (text.charCodeAt(0) === 65279) {
-          return JSON.parse(text.slice(1));
-        }
-        return JSON.parse(text);
-      } catch (e) {
-        throw new Error(`Invalid JSON response: ${e.message}`);
-      }
-    });
-    this.responseTransformers.set("text", (data) => {
-      return data.toString("utf-8");
-    });
-    this.responseTransformers.set("html", (data) => {
-      const text = data.toString("utf-8");
-      if (!text.includes("<!DOCTYPE html>") && !text.includes("<html")) {
-        throw new Error("Invalid HTML response");
-      }
-      return text;
-    });
-    this.responseTransformers.set("buffer", (data) => data);
-  }
-  _registerDefaultValidators() {
-    this.responseValidators.set("json", (data, schema) => {
-      if (!schema) return true;
-      try {
-        for (const [key, type] of Object.entries(schema)) {
-          if (typeof data[key] !== type) {
-            throw new Error(`Invalid type for ${key}`);
-          }
-        }
-        return true;
-      } catch (error) {
-        throw new Error(`Schema validation failed: ${error.message}`);
-      }
-    });
-    this.responseValidators.set("html", (data) => {
-      const text = Buffer.isBuffer(data) ? data.toString("utf-8") : String(data || "");
-      return text.includes("<!DOCTYPE") || text.includes("<html");
-    });
-  }
-  _cleanupSessions() {
-    const now = Date.now();
-    let cleanedCount = 0;
-    for (const [domain, session] of this.sessions.entries()) {
-      if (now - session.lastAccess > this.sessionConfig.ttl) {
-        this.sessions.delete(domain);
-        cleanedCount++;
-      }
-    }
-    if (cleanedCount > 0) {
-      this.metrics.activeSessions = this.sessions.size;
-      this.events.emit("sessions:cleanup", { cleaned: cleanedCount });
-    }
-  }
-  async _getSession(domain) {
-    let session = this.sessions.get(domain);
-    if (this.sessions.size > this.sessionConfig.maxSessions) {
-      for (const [key, sess] of this.sessions.entries()) {
-        if (Date.now() - sess.lastAccess > this.sessionConfig.ttl) {
-          this.sessions.delete(key);
-        }
-      }
-    }
-    if (!session || Date.now() - session.lastAccess > this.sessionConfig.ttl) {
-      session = {
-        cookies: /* @__PURE__ */ new Map(),
-        lastAccess: Date.now(),
-        customHeaders: /* @__PURE__ */ new Map()
-      };
-      this.sessions.set(domain, session);
-    }
-    session.lastAccess = Date.now();
-    return session;
-  }
-  // Bounded URL cache — `new URL()` runs every request; hot endpoints and
-  // polling repeat the same URL string, so cache the parsed object.
-  _parseUrl(url) {
-    const cached = this._urlCache.get(url);
-    if (cached) return cached;
-    const parsed = new URL(url);
-    if (this._urlCache.size > 1024) this._urlCache.clear();
-    this._urlCache.set(url, parsed);
-    return parsed;
-  }
-  _mergeConfig(customConfig) {
-    if (!customConfig || Object.keys(customConfig).length === 0) {
-      return this.config;
-    }
-    const cached = this._mergeCache.get(customConfig);
-    if (cached) return cached;
-    const merged = { ...this.config };
-    for (const key in customConfig) {
-      const v = customConfig[key];
-      const base = this.config[key];
-      if (v && typeof v === "object" && !Array.isArray(v) && base && typeof base === "object" && !Array.isArray(base)) {
-        merged[key] = { ...base, ...v };
-      } else {
-        merged[key] = v;
-      }
-    }
-    this._mergeCache.set(customConfig, merged);
-    return merged;
-  }
-  _emit(event, factory) {
-    if (this.events.hasListeners(event)) {
-      this.events.emit(event, factory());
-    }
-  }
-  async request(method, url, data = null, customConfig = {}) {
-    const startTime = Date.now();
-    const config = this._mergeConfig(customConfig);
-    const upperMethod = method.toUpperCase();
-    const isGet = upperMethod === "GET";
-    const formattedUrl = this._formatUrl(url, config.params);
-    if (config.cache.enabled && isGet && !config.stream) {
-      const cacheKey = this.cache.getCacheKey(upperMethod, formattedUrl, data, {
-        ...config.cache,
-        vary: this._authVary(config)
-      });
-      if (config.cache.staleWhileRevalidate) {
-        const peeked = this.cache.peek(cacheKey);
-        if (peeked) {
-          this.metrics.cacheHits++;
-          this._emit(events.CACHE_HIT, () => ({ url: formattedUrl, stale: peeked.stale }));
-          if (peeked.stale && !this._refreshing.has(cacheKey)) {
-            this._refreshing.add(cacheKey);
-            this._refreshCacheEntry(cacheKey, upperMethod, formattedUrl, data, config).catch(() => {
-            }).finally(() => this._refreshing.delete(cacheKey));
-          }
-          return peeked.value;
-        }
-      } else {
-        const cachedResponse = this.cache.get(cacheKey);
-        if (cachedResponse) {
-          this.metrics.cacheHits++;
-          this._emit(events.CACHE_HIT, () => ({ url: formattedUrl }));
-          return cachedResponse;
-        }
-      }
-      this.metrics.cacheMisses++;
-      this._emit(events.CACHE_MISS, () => ({ url: formattedUrl }));
-    }
-    const urlObj = this._parseUrl(formattedUrl);
-    const routeKey = config.trackRouteTimes ? `${upperMethod} ${urlObj.pathname}` : null;
-    const dedupKey = isGet && !config.stream ? `${upperMethod}:${formattedUrl}:${this._authVary(config)}` : null;
-    if (dedupKey && config.deduplicate !== false) {
-      const pending = this.pendingRequests.get(dedupKey);
-      if (pending) {
-        this._log("debug", `Deduplicating request: ${dedupKey}`);
-        return pending;
-      }
-    }
-    this._emit(events.REQUEST_START, () => ({ method: upperMethod, url: formattedUrl, config }));
-    const requestPromise = this._executeRequest(upperMethod, formattedUrl, data, config, startTime, routeKey, urlObj);
-    if (dedupKey && config.deduplicate !== false) {
-      this.pendingRequests.set(dedupKey, requestPromise);
-      requestPromise.catch(() => {
-      }).finally(() => this.pendingRequests.delete(dedupKey));
-    }
-    return requestPromise;
-  }
-  // Background refresh for stale-while-revalidate cache entries.
-  async _refreshCacheEntry(cacheKey, method, url, data, config) {
-    try {
-      const result = await this._executeRequest(
-        method,
-        url,
-        data,
-        { ...config, cache: { enabled: false }, stream: false },
-        Date.now(),
-        null,
-        new URL(url)
-      );
-      if (result !== void 0 && result !== null) {
-        this.cache.set(cacheKey, result, config.cache.ttl);
-      }
-    } catch (_) {
-    }
-  }
-  async _executeRequest(method, url, data, config, startTime, routeKey, urlObj) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
-    if (config.signal && config.signal.aborted) {
-      throw new AbortError();
-    }
-    if (config.rateLimiting.enabled) {
-      try {
-        await this.rateLimiter.checkLimit(urlObj.hostname, config.rateLimiting);
-      } catch (error) {
-        this.events.emit(events.RATE_LIMIT, { url, error: error.message });
-        throw error;
-      }
-    }
-    const streamMode = !!config.stream;
-    if (streamMode && config.retries > 1) {
-      config = { ...config, retries: 1 };
-    }
-    const options = {
-      method,
-      hostname: urlObj.hostname,
-      port: urlObj.port ? Number(urlObj.port) : void 0,
-      path: urlObj.pathname + urlObj.search,
-      headers: generateHeaders(config),
-      // Only create a native socket timer when a timeout is configured.
-      timeout: typeof config.timeout === "number" ? config.timeout : void 0,
-      rejectUnauthorized: config.validateSSL,
-      config
-      // Store original config for interceptors
-    };
-    if (config.agent) {
-      options.agent = config.agent;
-    } else if (!config.transport || config.transport === "http") {
-      const hostKey = `${urlObj.hostname}:${urlObj.port || (urlObj.protocol === "https:" ? 443 : 80)}`;
-      options.agent = getAgent(urlObj.protocol, hostKey, config, this.connectionPool);
-    }
-    const cookies = this.cookieJar.getCookies(urlObj.href);
-    if (cookies) {
-      options.headers["Cookie"] = cookies;
-    }
-    if (!options.headers["Authorization"]) {
-      if (config.auth && config.auth.username !== void 0) {
-        options.headers["Authorization"] = "Basic " + Buffer.from(`${config.auth.username}:${config.auth.password || ""}`).toString("base64");
-      } else if (config.bearer) {
-        options.headers["Authorization"] = `Bearer ${config.bearer}`;
-      } else if (config.token) {
-        options.headers["Authorization"] = config.token;
-      }
-    }
-    if (data && config.formData) {
-      const formData = await this._createFormData(data);
-      data = formData.data;
-      options.headers["Content-Type"] = `multipart/form-data; boundary=${formData.boundary}`;
-    } else if (data && typeof data === "object" && !Buffer.isBuffer(data) && !(data instanceof Readable) && !options.headers["Content-Type"]) {
-      options.headers["Content-Type"] = "application/json";
-    }
-    if (data && typeof data === "object" && !Buffer.isBuffer(data) && !(data instanceof Readable) && !options.headers["Content-Encoding"]) {
-      const compressedData = await this._compressData(data);
-      data = compressedData.data;
-      options.headers["Content-Encoding"] = compressedData.encoding;
-    }
-    let finalOptions = options;
-    if (this.interceptors.request.handlers.length > 0) {
-      try {
-        finalOptions = await this.interceptors.request.executeRequestChain(options);
-      } catch (error) {
-        throw new RequestError("Request interceptor error", {
-          original: error,
-          options
-        });
-      }
-    }
-    let attempt = 0;
-    let redirectCount = config.redirectCount || 0;
-    let circuitBreaker = null;
-    if (config.circuitBreaker && config.circuitBreaker.enabled) {
-      circuitBreaker = this.circuitBreakers.get(urlObj.hostname);
-      if (!circuitBreaker) {
-        circuitBreaker = new CircuitBreaker(config.circuitBreaker);
-        this.circuitBreakers.set(urlObj.hostname, circuitBreaker);
-      }
-    }
-    if (config.humanize) {
-      await delay(Math.random() * 1e3 + 500, config.signal);
-    }
-    if (config.onRequest) {
-      try {
-        config.onRequest({ method, url, options: finalOptions });
-      } catch (_) {
-      }
-    }
-    const useHttp2 = config.useHttp2 && urlObj.protocol === "https:" && !streamMode;
-    const useUndici = config.transport === "undici" && !useHttp2 && !streamMode;
-    const performRequest = useUndici ? () => this._undiciRequest(urlObj, finalOptions, data) : useHttp2 ? () => this._makeHttp2Request(urlObj, finalOptions, data) : () => this._makeRequest(urlObj.protocol, finalOptions, data);
-    while (attempt < config.retries) {
-      try {
-        const response = circuitBreaker ? await circuitBreaker.execute(performRequest, urlObj.hostname) : await performRequest();
-        if (useHttp2) this.metrics.http2Requests++;
-        if (circuitBreaker && response.status >= 500) {
-          circuitBreaker.handleFailure(urlObj.hostname);
-        }
-        if (config.followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
-          if (redirectCount >= config.maxRedirects) {
-            const err = new Error(`Max redirects exceeded (${config.maxRedirects})`);
-            err.code = "MAX_REDIRECTS";
-            err._noRetry = true;
-            throw err;
-          }
-          redirectCount++;
-          this.metrics.redirects++;
-          const location = response.headers.location;
-          this.events.emit(events.REDIRECT, { from: url, to: location });
-          const redirectUrl = location.includes("://") ? location : new URL(location, url).href;
-          if (response.data && typeof response.data.destroy === "function") {
-            response.data.destroy();
-          }
-          return this.request(method, redirectUrl, data, {
-            ...config,
-            params: void 0,
-            redirectCount,
-            deduplicate: false
-          });
-        }
-        const responseCookies = response.headers["set-cookie"];
-        if (Array.isArray(responseCookies)) {
-          responseCookies.forEach((cookie) => {
-            this.cookieJar.setCookie(urlObj.hostname, cookie);
-          });
-        }
-        const processedResponse = this.interceptors.response.handlers.length > 0 ? await this.interceptors.response.executeResponseChain(response) : response;
-        const requestTime = Date.now() - startTime;
-        processedResponse.duration = requestTime;
-        const bodyLength = processedResponse.data ? processedResponse.data.length ?? 0 : 0;
-        this.metrics.requestCount++;
-        this.metrics.totalTime += requestTime;
-        this.metrics.successCount++;
-        this.metrics.lastRequestTime = requestTime;
-        this.metrics.totalDataTransferred += bodyLength;
-        if (config.trackRouteTimes) {
-          let routeTime = this.routeMetrics.get(routeKey) || { count: 0, totalTime: 0 };
-          routeTime.count++;
-          routeTime.totalTime += requestTime;
-          this.routeMetrics.set(routeKey, routeTime);
-          this.metrics.routeTimes.set(routeKey, routeTime.totalTime / routeTime.count);
-        }
-        this._emit(events.REQUEST_END, () => ({
-          method,
-          url,
-          status: processedResponse.status,
-          time: requestTime,
-          size: bodyLength
-        }));
-        if (method === "HEAD") {
-          return processedResponse.headers;
-        }
-        if (method === "OPTIONS") {
-          return processedResponse.headers;
-        }
-        if (streamMode) {
-          if (config.onResponse) {
-            try {
-              config.onResponse(processedResponse.data, processedResponse);
-            } catch (_) {
-            }
-          }
-          return processedResponse.data;
-        }
-        const processed = this._processResponse(processedResponse, config.responseType);
-        const result = processed && typeof processed.then === "function" ? await processed : processed;
-        if (config.responseSchema && !streamMode && config.responseType !== "raw") {
-          const type = detectResponseType(processedResponse.headers["content-type"] || "");
-          const validator = this.responseValidators.get(type);
-          if (validator) {
-            validator(result, config.responseSchema);
-          }
-        }
-        if (config.cache.enabled && method === "GET" && processedResponse.status === 200 && !streamMode) {
-          const cacheKey = this.cache.getCacheKey(method, url, data, {
-            ...config.cache,
-            vary: this._authVary(config)
-          });
-          this.cache.set(cacheKey, result, config.cache.ttl);
-          this._emit(events.CACHE_STORE, () => ({ url }));
-        }
-        if (config.onResponse) {
-          try {
-            config.onResponse(result, processedResponse);
-          } catch (_) {
-          }
-        }
-        return result;
-      } catch (error) {
-        if (error._noRetry || error instanceof AbortError) {
-          this.metrics.errorCount++;
-          this.events.emit(events.REQUEST_ERROR, error);
-          if (config.onError) {
-            try {
-              config.onError(error);
-            } catch (_) {
-            }
-          }
-          throw error;
-        }
-        const status = ((_a = error.response) == null ? void 0 : _a.status) || ((_c = (_b = error.context) == null ? void 0 : _b.response) == null ? void 0 : _c.status);
-        let shouldRetry;
-        if (config.retryOn) {
-          shouldRetry = Array.isArray(config.retryOn) ? status !== void 0 && config.retryOn.includes(status) : config.retryOn(error) === true;
-        } else {
-          shouldRetry = !(status >= 400 && status < 500 && status !== 429);
-        }
-        if (!shouldRetry) {
-          this.metrics.errorCount++;
-          this.events.emit(events.REQUEST_ERROR, error);
-          if (config.onError) {
-            try {
-              config.onError(error);
-            } catch (_) {
-            }
-          }
-          throw error;
-        }
-        attempt++;
-        this.metrics.retries++;
-        this.metrics.errorCount++;
-        if (!(error instanceof SwiftlyError)) {
-          error = new RequestError(error.message, {
-            original: error,
-            method,
-            url,
-            config
-          });
-        }
-        let nextDelay = config.retryBackoff ? config.retryDelay * Math.pow(config.retryBackoff, attempt - 1) : config.retryDelay * attempt;
-        const retryAfter = ((_e = (_d = error.response) == null ? void 0 : _d.headers) == null ? void 0 : _e["retry-after"]) ?? ((_h = (_g = (_f = error.context) == null ? void 0 : _f.response) == null ? void 0 : _g.headers) == null ? void 0 : _h["retry-after"]);
-        if (retryAfter) {
-          const secs = parseInt(retryAfter, 10);
-          if (!isNaN(secs)) {
-            nextDelay = Math.min(secs * 1e3, config.maxRetryAfter ?? Infinity);
-          }
-        }
-        if (config.retryJitter) {
-          const jitterMax = config.retryJitter === true ? nextDelay : config.retryJitter;
-          nextDelay += Math.random() * jitterMax;
-        }
-        if (config.onRetry) {
-          try {
-            config.onRetry(attempt, error, nextDelay);
-          } catch (_) {
-          }
-        }
-        this.events.emit(events.RETRY_ATTEMPT, {
-          attempt,
-          error: error.message,
-          nextRetryDelay: nextDelay
-        });
-        if (attempt === config.retries) {
-          this.events.emit(events.REQUEST_ERROR, error);
-          if (config.onError) {
-            try {
-              config.onError(error);
-            } catch (_) {
-            }
-          }
-          throw error;
-        }
-        await delay(nextDelay, config.signal);
-      }
-    }
-  }
-  async _makeHttp2Request(urlObj, options, data) {
-    const authority = `${urlObj.hostname}:${urlObj.port || 443}`;
-    let session = this.http2Sessions.get(authority);
-    if (!session || session.destroyed) {
-      session = http22.connect(urlObj.href, {
-        rejectUnauthorized: options.rejectUnauthorized
-      });
-      this.http2Sessions.set(authority, session);
-      session.on("error", () => {
-        this.http2Sessions.delete(authority);
-      });
-      session.on("goaway", () => {
-        this.http2Sessions.delete(authority);
-      });
-    }
-    return new Promise((resolve, reject) => {
-      var _a;
-      const headers = { ...options.headers };
-      delete headers["connection"];
-      delete headers["keep-alive"];
-      delete headers["transfer-encoding"];
-      delete headers["upgrade-insecure-requests"];
-      delete headers["host"];
-      const req = session.request({
-        ...headers,
-        ":method": options.method,
-        ":path": options.path,
-        ":authority": urlObj.host,
-        ":scheme": "https"
-      });
-      const signal = (_a = options.config) == null ? void 0 : _a.signal;
-      if (signal) {
-        if (signal.aborted) {
-          req.destroy(new AbortError());
-        } else {
-          const onAbort = () => req.destroy(new AbortError());
-          signal.addEventListener("abort", onAbort, { once: true });
-          req.once("close", () => signal.removeEventListener("abort", onAbort));
-        }
-      }
-      const chunks = [];
-      let totalBytes = 0;
-      let responseHeaders = null;
-      let responseStatus = null;
-      req.on("response", (headers2) => {
-        responseStatus = headers2[":status"];
-        responseHeaders = { ...headers2 };
-        delete responseHeaders[":status"];
-        delete responseHeaders[":method"];
-        delete responseHeaders[":path"];
-        delete responseHeaders[":authority"];
-        delete responseHeaders[":scheme"];
-      });
-      req.on("data", (chunk) => {
-        chunks.push(chunk);
-        totalBytes += chunk.length;
-        if (responseHeaders) {
-          const total = parseInt(responseHeaders["content-length"], 10) || 0;
-          if (total && this.events.hasListeners(events.PROGRESS)) {
-            this.events.emit(events.PROGRESS, {
-              loaded: totalBytes,
-              total,
-              percent: totalBytes / total * 100
-            });
-          }
-        }
-      });
-      req.on("end", () => {
-        let body = Buffer.concat(chunks);
-        const encoding = responseHeaders && responseHeaders["content-encoding"];
-        const contentLength = parseInt(responseHeaders && responseHeaders["content-length"], 10) || 0;
-        const cfg = options.config || this.config;
-        if (cfg.compression.response && cfg.decompress !== false && contentLength >= cfg.compression.responseMinSize && encoding) {
-          try {
-            if (encoding === "gzip") {
-              body = zlib.gunzipSync(body);
-            } else if (encoding === "deflate") {
-              body = zlib.inflateSync(body);
-            } else if (encoding === "br") {
-              body = zlib.brotliDecompressSync(body);
-            }
-          } catch (e) {
-            reject(new RequestError("Decompression failed", { original: e, options }));
-            return;
-          }
-        }
-        resolve({
-          data: body,
-          headers: responseHeaders,
-          status: responseStatus,
-          config: options
-        });
-      });
-      req.on("error", reject);
-      if (data) {
-        if (data instanceof Readable) {
-          data.pipe(req);
-        } else {
-          const payload = Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data);
-          req.write(payload);
-        }
-      }
-      req.end();
-    });
-  }
-  _setupTimeouts(req, options) {
-    const configured = options.config && options.config.timeouts;
-    if (!configured) return;
-    const timeouts = {
-      connect: configured.connect || 5e3,
-      response: configured.response || 3e4,
-      idle: configured.idle || 6e4
-    };
-    let connectTimer = null;
-    let responseTimer = null;
-    let idleTimer = null;
-    const clearAll = () => {
-      if (connectTimer) {
-        clearTimeout(connectTimer);
-        connectTimer = null;
-      }
-      if (responseTimer) {
-        clearTimeout(responseTimer);
-        responseTimer = null;
-      }
-      if (idleTimer) {
-        clearTimeout(idleTimer);
-        idleTimer = null;
-      }
-    };
-    req.once("close", clearAll);
-    req.once("error", clearAll);
-    connectTimer = setTimeout(() => {
-      req.destroy(new TimeoutError("Connection timeout", "connect"));
-    }, timeouts.connect);
-    req.once("socket", () => {
-      if (connectTimer) {
-        clearTimeout(connectTimer);
-        connectTimer = null;
-      }
-      responseTimer = setTimeout(() => {
-        req.destroy(new TimeoutError("Response timeout", "response"));
-      }, timeouts.response);
-    });
-    req.once("response", (res) => {
-      if (responseTimer) {
-        clearTimeout(responseTimer);
-        responseTimer = null;
-      }
-      const isStreaming = !!(options.config && options.config.stream);
-      if (isStreaming) return;
-      const startIdle = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-        }
-        idleTimer = setTimeout(() => {
-          req.destroy(new TimeoutError("Idle timeout", "idle"));
-        }, timeouts.idle);
-      };
-      startIdle();
-      res.on("data", startIdle);
-      res.once("end", () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
-      });
-      res.once("error", clearAll);
-    });
-  }
-  _prepareHostname(options) {
-    if (!options.hostname || !options.hostname.includes(":")) return;
-    options.hostname = options.hostname.replace(/^\[|\]$/g, "");
-    const ipv6Pattern = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|::)$/;
-    if (!ipv6Pattern.test(options.hostname)) {
-      throw new ValidationError("Invalid IPv6 address format", { hostname: options.hostname });
-    }
-    options.hostname = `[${options.hostname}]`;
-  }
-  _attachSignal(req, options) {
-    var _a;
-    const signal = (_a = options.config) == null ? void 0 : _a.signal;
-    if (!signal) return;
-    if (signal.aborted) {
-      req.destroy(new AbortError());
-      return;
-    }
-    const onAbort = () => {
-      this.events.emit(events.ABORT, { url: options.path });
-      req.destroy(new AbortError());
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-    req.once("close", () => signal.removeEventListener("abort", onAbort));
-  }
-  _enhanceError(error, options, protocol) {
-    if (error instanceof SwiftlyError) return error;
-    switch (error.code) {
-      case "ECONNREFUSED":
-        return new RequestError("Connection refused", { original: error, options, protocol });
-      case "ENOTFOUND":
-        return new RequestError("Host not found", { original: error, options, protocol });
-      case "ECONNRESET":
-        return new RequestError("Connection reset", { original: error, options, protocol });
-      case "ETIMEDOUT":
-        return new TimeoutError("Connection timed out", "connect", { original: error, options, protocol });
-      default:
-        return new RequestError(error.message, { original: error, options, protocol });
-    }
-  }
-  _sendPayload(req, data, config = {}) {
-    if (!data) {
-      req.end();
-      return;
-    }
-    if (data instanceof Readable) {
-      let loaded = 0;
-      data.on("data", (chunk) => {
-        loaded += chunk.length;
-        const progress = { loaded, total: 0, percent: 0 };
-        if (config.onUploadProgress) config.onUploadProgress(progress);
-        this._emit(events.UPLOAD_PROGRESS, () => progress);
-      });
-      data.on("error", (err) => req.destroy(err));
-      data.pipe(req);
-      return;
-    }
-    const payload = Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data);
-    const bytes = Buffer.byteLength(payload);
-    req.write(payload, () => {
-      const progress = { loaded: bytes, total: bytes, percent: 100 };
-      if (config.onUploadProgress) config.onUploadProgress(progress);
-      this._emit(events.UPLOAD_PROGRESS, () => progress);
-    });
-    req.end();
-  }
-  _handleResponseStream(res, options, resolve, reject) {
-    const requestCfg = options.config || this.config;
-    const isHead = options.method === "HEAD" || options.method === "OPTIONS";
-    if (isHead) {
-      resolve({
-        data: Buffer.alloc(0),
-        headers: res.headers,
-        status: res.statusCode,
-        config: options
-      });
-      return;
-    }
-    if (requestCfg.stream) {
-      const encoding2 = res.headers["content-encoding"];
-      let stream2 = res;
-      if (requestCfg.compression.response && encoding2 && requestCfg.decompress !== false) {
-        if (encoding2 === "gzip") {
-          stream2 = res.pipe(zlib.createGunzip());
-        } else if (encoding2 === "deflate") {
-          stream2 = res.pipe(zlib.createInflate());
-        } else if (encoding2 === "br") {
-          stream2 = res.pipe(zlib.createBrotliDecompress());
-        }
-      }
-      stream2.headers = res.headers;
-      stream2.status = res.statusCode;
-      stream2.total = parseInt(res.headers["content-length"], 10) || 0;
-      stream2.on("error", (error) => {
-        reject(new RequestError("Stream error", { original: error, options }));
-      });
-      resolve({
-        data: stream2,
-        headers: res.headers,
-        status: res.statusCode,
-        config: options
-      });
-      return;
-    }
-    const chunks = [];
-    let stream = res;
-    const contentLength = parseInt(res.headers["content-length"], 10) || 0;
-    const encoding = res.headers["content-encoding"];
-    const isDecompressing = requestCfg.compression.response && requestCfg.decompress !== false && encoding && contentLength >= requestCfg.compression.responseMinSize;
-    if (isDecompressing) {
-      if (encoding === "gzip") {
-        stream = res.pipe(zlib.createGunzip());
-      } else if (encoding === "deflate") {
-        stream = res.pipe(zlib.createInflate());
-      } else if (encoding === "br") {
-        stream = res.pipe(zlib.createBrotliDecompress());
-      }
-    }
-    let totalBytes = contentLength;
-    let receivedBytes = 0;
-    const canPrealloc = !isDecompressing && contentLength > 0;
-    let prealloc = canPrealloc ? Buffer.allocUnsafe(contentLength) : null;
-    let writeOffset = 0;
-    const hasProgress = totalBytes > 0 && (requestCfg.onDownloadProgress || this.events.hasListeners(events.PROGRESS) || this.events.hasListeners(events.DOWNLOAD_PROGRESS));
-    stream.on("data", (chunk) => {
-      receivedBytes += chunk.length;
-      if (prealloc) {
-        if (writeOffset === 0 && receivedBytes === contentLength) {
-          prealloc = chunk;
-          writeOffset = contentLength;
-        } else {
-          chunk.copy(prealloc, writeOffset);
-          writeOffset += chunk.length;
-        }
-      } else {
-        chunks.push(chunk);
-      }
-      if (hasProgress) {
-        const progress = {
-          loaded: receivedBytes,
-          total: totalBytes,
-          percent: receivedBytes / totalBytes * 100
-        };
-        if (this.events.hasListeners(events.PROGRESS)) {
-          this.events.emit(events.PROGRESS, progress);
-        }
-        if (this.events.hasListeners(events.DOWNLOAD_PROGRESS)) {
-          this.events.emit(events.DOWNLOAD_PROGRESS, progress);
-        }
-        if (requestCfg.onDownloadProgress) requestCfg.onDownloadProgress(progress);
-      }
-    });
-    stream.on("end", () => {
-      const data = prealloc ? writeOffset === contentLength ? prealloc : prealloc.subarray(0, writeOffset) : Buffer.concat(chunks);
-      resolve({
-        data,
-        headers: res.headers,
-        status: res.statusCode,
-        config: options
-        // Include original config for error handling
-      });
-    });
-    stream.on("error", (error) => {
-      reject(new RequestError("Stream error", {
-        original: error,
-        options
-      }));
-    });
-  }
-  _makeRequest(protocol, options, data) {
-    if (options.config && options.config.proxy) {
-      return this._makeProxiedRequest(protocol, options, data);
-    }
-    return new Promise((resolve, reject) => {
-      try {
-        this._prepareHostname(options);
-      } catch (error) {
-        return reject(new RequestError("Invalid IPv6 address", {
-          original: error,
-          options,
-          protocol
-        }));
-      }
-      const client = protocol === "https:" ? https2 : http2;
-      const req = client.request(options, (res) => {
-        this._handleResponseStream(res, options, resolve, reject);
-      });
-      this._attachSignal(req, options);
-      this._setupTimeouts(req, options);
-      req.on("error", (error) => {
-        reject(this._enhanceError(error, options, protocol));
-      });
-      this._sendPayload(req, data, options.config || {});
-    });
-  }
-  _makeProxiedRequest(protocol, options, data) {
-    return new Promise((resolve, reject) => {
-      const proxy = options.config.proxy;
-      const proxyHost = proxy.host;
-      const proxyPort = proxy.port || (protocol === "https:" ? 443 : 80);
-      let proxyAuth = null;
-      if (proxy.auth) {
-        const creds = typeof proxy.auth === "string" ? proxy.auth : `${proxy.auth.username}:${proxy.auth.password || ""}`;
-        proxyAuth = "Basic " + Buffer.from(creds).toString("base64");
-      }
-      const handler = (res) => this._handleResponseStream(res, options, resolve, reject);
-      if (protocol === "https:") {
-        const connectReq = http2.request({
-          host: proxyHost,
-          port: proxyPort,
-          method: "CONNECT",
-          path: `${options.hostname}:${options.port || 443}`,
-          headers: proxyAuth ? { "Proxy-Authorization": proxyAuth } : {}
-        });
-        connectReq.on("connect", (res, socket) => {
-          if (res.statusCode !== 200) {
-            socket.destroy();
-            reject(new RequestError(`Proxy CONNECT failed: HTTP ${res.statusCode}`, { options, protocol }));
-            return;
-          }
-          this.events.emit(events.PROXY_CONNECT, { host: options.hostname, proxyHost });
-          const servername = String(options.hostname).replace(/^\[|\]$/g, "");
-          const tlsSocket = tls.connect({
-            socket,
-            servername,
-            rejectUnauthorized: options.rejectUnauthorized
-          });
-          const req = https2.request({
-            ...options,
-            createConnection: () => tlsSocket,
-            agent: false
-          }, handler);
-          this._attachSignal(req, options);
-          this._setupTimeouts(req, options);
-          req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
-          this._sendPayload(req, data, options.config || {});
-        });
-        connectReq.on("error", (error) => {
-          reject(new RequestError("Proxy connection failed", { original: error, options, protocol }));
-        });
-        connectReq.end();
-      } else {
-        const target = `http://${options.hostname}:${options.port || 80}${options.path}`;
-        const headers = { ...options.headers, Host: `${options.hostname}:${options.port || 80}` };
-        if (proxyAuth) headers["Proxy-Authorization"] = proxyAuth;
-        const req = http2.request({
-          host: proxyHost,
-          port: proxyPort,
-          method: options.method,
-          path: target,
-          headers,
-          agent: false
-        }, handler);
-        this._attachSignal(req, options);
-        this._setupTimeouts(req, options);
-        req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
-        this._sendPayload(req, data, options.config || {});
-      }
-    });
-  }
-  _processResponse(response, responseType) {
-    if (response.status >= 400) {
-      throw new ResponseError(`HTTP Error ${response.status}`, response);
-    }
-    const contentType = response.headers["content-type"] || "";
-    const type = responseType && responseType !== "raw" ? responseType : detectResponseType(contentType);
-    const validTypes = ["json", "text", "html", "buffer", "raw"];
-    if (responseType && !validTypes.includes(responseType)) {
-      this._log("error", `Invalid responseType: ${responseType}, falling back to buffer`);
-    }
-    const transformer = this.responseTransformers.get(type) || this.responseTransformers.get("buffer");
-    if (!transformer) {
-      this._log("error", `No transformer found for type: ${type}, using buffer`);
-      return response.data;
-    }
-    const finish = (data) => {
-      if (responseType === "raw") {
-        return {
-          data,
-          status: response.status,
-          headers: response.headers,
-          config: response.config,
-          duration: response.duration
-        };
-      }
-      return data;
-    };
-    try {
-      const result = transformer(response.data, response.headers);
-      if (result && typeof result.then === "function") {
-        return result.then(
-          finish,
-          (error) => {
-            error.response = response;
-            error.type = type;
-            throw error;
-          }
-        );
-      }
-      return finish(result);
-    } catch (error) {
-      error.response = response;
-      error.type = type;
-      throw error;
-    }
-  }
-  async _compressData(data) {
-    let jsonStr;
-    try {
-      jsonStr = JSON.stringify(data);
-    } catch (error) {
-      throw new ValidationError(`Cannot serialize data: ${error.message}`, { data: typeof data });
-    }
-    if (!this.config.compression.request) {
-      return { data: jsonStr, encoding: "identity" };
-    }
-    if (jsonStr.length < this.config.compression.minSize) {
-      return { data: jsonStr, encoding: "identity" };
-    }
-    return new Promise((resolve, reject) => {
-      zlib.gzip(jsonStr, {
-        level: 6,
-        // Balanced compression
-        memLevel: 8
-        // Moderate memory usage
-      }, (err, compressed) => {
-        if (err) {
-          resolve({ data: jsonStr, encoding: "identity" });
-        } else {
-          resolve({ data: compressed, encoding: "gzip" });
-        }
-      });
-    });
-  }
-  async _createFormData(data) {
-    if (!data || typeof data !== "object") {
-      throw new ValidationError("FormData must be an object");
-    }
-    const boundary = `----WebKitFormBoundary${Math.random().toString(36).slice(2)}`;
-    const chunks = [];
-    for (const [key, value] of Object.entries(data)) {
-      if (!key || typeof key !== "string") {
-        throw new ValidationError("FormData keys must be non-empty strings");
-      }
-      chunks.push(Buffer.from(`\r
---${boundary}\r
-`));
-      if (Buffer.isBuffer(value) || value && value.buffer instanceof ArrayBuffer) {
-        const filename = value.name || "file";
-        chunks.push(Buffer.from(`Content-Disposition: form-data; name="${key}"; filename="${filename}"\r
-`));
-        chunks.push(Buffer.from(`Content-Type: ${value.type || "application/octet-stream"}\r
-\r
-`));
-        chunks.push(Buffer.isBuffer(value) ? value : Buffer.from(value.buffer));
-      } else {
-        chunks.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r
-\r
-`));
-        chunks.push(Buffer.from(String(value)));
-      }
-    }
-    chunks.push(Buffer.from(`\r
---${boundary}--\r
-`));
-    return {
-      boundary,
-      data: Buffer.concat(chunks)
-    };
-  }
-  // GraphQL support
-  async query(url, { query, variables = {} } = {}, config = {}) {
-    let endpoint = url;
-    let queryData = query;
-    let vars = variables;
-    if (typeof url === "string" && (url.trim().startsWith("{") || url.trim().startsWith("query") || url.trim().startsWith("mutation"))) {
-      queryData = url;
-      vars = query || {};
-      endpoint = config.endpoint || "/graphql";
-    }
-    const data = {
-      query: queryData,
-      variables: vars
-    };
-    const response = await this.post(endpoint, data, {
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      ...config
-    });
-    if (response && response.data) {
-      return response.data;
-    }
-    if (response && response.errors && response.errors.length > 0) {
-      const error = new Error(response.errors[0].message);
-      error.graphqlErrors = response.errors;
-      throw error;
-    }
-    return response;
-  }
-  // Server-Sent Events support
-  async subscribe(url, callbacks = {}, config = {}) {
-    const { onMessage, onError, onOpen } = callbacks;
-    const urlObj = new URL(url);
-    const options = {
-      ...this.config,
-      ...config,
-      headers: {
-        ...generateHeaders(config),
-        "Accept": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      }
-    };
-    return new Promise((resolve, reject) => {
-      const client = urlObj.protocol === "https:" ? https2 : http2;
-      const reqOptions = { ...options };
-      if (typeof reqOptions.timeout !== "number") delete reqOptions.timeout;
-      const req = client.request(urlObj, reqOptions, (res) => {
-        if (res.statusCode !== 200) {
-          const err = new Error(`SSE connection failed: ${res.statusCode}`);
-          if (onError) onError(err);
-          reject(err);
-          return;
-        }
-        res.setEncoding("utf8");
-        let buffer = "";
-        if (onOpen) onOpen();
-        resolve(() => req.destroy());
-        res.on("data", (chunk) => {
-          buffer += chunk;
-          const lines = buffer.split("\n");
-          buffer = lines.pop();
-          lines.forEach((line) => {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6);
-              try {
-                const parsedData = JSON.parse(data);
-                if (onMessage) onMessage(parsedData);
-              } catch (e) {
-                if (onMessage) onMessage(data);
-              }
-            }
-          });
-        });
-        res.on("error", (error) => {
-          if (onError) onError(error);
-          reject(error);
-        });
-      });
-      req.on("error", (error) => {
-        if (onError) onError(error);
-        reject(error);
-      });
-      req.end();
-    });
-  }
-  // Event handling methods
-  on(event, callback) {
-    return this.events.on(event, callback);
-  }
-  off(event, callback) {
-    return this.events.off(event, callback);
-  }
-  // Get current metrics
-  getMetrics() {
-    return {
-      ...this.metrics,
-      averageResponseTime: this.metrics.requestCount ? this.metrics.totalTime / this.metrics.requestCount : 0,
-      activeSessions: this.sessions.size,
-      pooledConnections: this.connectionPool.size,
-      http2Sessions: this.http2Sessions.size,
-      cacheSize: this.cache.getStats().size,
-      circuitBreakers: Array.from(this.circuitBreakers.entries()).map(([domain, cb]) => ({
-        domain,
-        state: cb.getState()
-      }))
-    };
-  }
-  // Clear all caches
-  clearCache() {
-    this.cache.clear();
-    this._log("info", "Cache cleared");
-  }
-  // Reset circuit breakers
-  resetCircuitBreakers(domain = null) {
-    if (domain) {
-      this.circuitBreakers.delete(domain);
-      this._log("info", `Circuit breaker reset for domain: ${domain}`);
-    } else {
-      this.circuitBreakers.clear();
-      this._log("info", "All circuit breakers reset");
-    }
-  }
-  // Batch requests
-  async batch(requests) {
-    if (!Array.isArray(requests)) {
-      throw new ValidationError("Batch requests must be an array");
-    }
-    return Promise.all(requests.map((req) => {
-      const { method = "GET", url, data, config } = req;
-      const methodLower = method.toLowerCase();
-      const methodsWithBody = ["post", "put", "patch"];
-      if (methodsWithBody.includes(methodLower)) {
-        return this[methodLower](url, data, config).catch((err) => ({ error: err }));
-      } else {
-        return this[methodLower](url, config).catch((err) => ({ error: err }));
-      }
-    }));
-  }
-  // Download file helper - resolves with the raw Buffer (consistent with responseType: 'buffer')
-  async download(url, config = {}) {
-    return this.get(url, { ...config, responseType: "buffer" });
-  }
-  // Stream a download directly to disk with progress reporting.
-  async downloadTo(url, filePath, config = {}) {
-    const stream = await this.get(url, { ...config, stream: true });
-    const { onProgress } = config;
-    const total = stream.total || 0;
-    let loaded = 0;
-    if (typeof stream.status === "number" && stream.status >= 400) {
-      try {
-        stream.destroy();
-      } catch {
-      }
-      throw new ResponseError(`HTTP Error ${stream.status}`, {
-        status: stream.status,
-        headers: stream.headers || {}
-      });
-    }
-    return new Promise((resolve, reject) => {
-      const ws = fs.createWriteStream(filePath);
-      stream.on("data", (chunk) => {
-        loaded += chunk.length;
-        if (onProgress) {
-          onProgress({ loaded, total, percent: total ? loaded / total * 100 : 0 });
-        }
-      });
-      stream.on("error", (err) => {
-        ws.destroy();
-        reject(err);
-      });
-      ws.on("error", reject);
-      ws.on("finish", () => resolve({ path: filePath, bytes: loaded }));
-      stream.pipe(ws);
-    });
-  }
-  // Optional undici transport (lazy-loaded, keeps the default path zero-dep)
-  async _undiciRequest(urlObj, options, data) {
-    var _a, _b, _c, _d;
-    let request;
-    try {
-      request = await loadUndici();
-    } catch (e) {
-      throw new ValidationError(
-        "transport: 'undici' requires the optional dependency 'undici' to be installed",
-        { transport: "undici" }
-      );
-    }
-    const body = data ? Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data) : void 0;
-    let result;
-    try {
-      result = await request(urlObj.href, {
-        method: options.method,
-        headers: options.headers,
-        body,
-        signal: (_a = options.config) == null ? void 0 : _a.signal,
-        headersTimeout: (_c = (_b = options.config) == null ? void 0 : _b.timeouts) == null ? void 0 : _c.response,
-        bodyTimeout: typeof ((_d = options.config) == null ? void 0 : _d.timeout) === "number" ? options.config.timeout : void 0,
-        maxRedirections: 0
-        // redirects are handled by swiftly
-      });
-    } catch (e) {
-      if (e && (e.name === "AbortError" || e.code === "UND_ERR_ABORTED" || e.code === "ABORT_ERR")) {
-        throw new AbortError();
-      }
-      throw e;
-    }
-    const { statusCode, headers: resHeaders, body: resBody } = result;
-    let buf = Buffer.from(await resBody.arrayBuffer());
-    const cfg = options.config || this.config;
-    const encoding = resHeaders["content-encoding"];
-    if (cfg.compression.response && cfg.decompress !== false && encoding) {
-      try {
-        if (encoding === "gzip") {
-          buf = zlib.gunzipSync(buf);
-        } else if (encoding === "deflate") {
-          buf = zlib.inflateSync(buf);
-        } else if (encoding === "br") {
-          buf = zlib.brotliDecompressSync(buf);
-        }
-      } catch (e) {
-        throw new RequestError("Decompression failed", { original: e, options });
-      }
-    }
-    return {
-      data: buf,
-      headers: resHeaders,
-      status: statusCode,
-      config: options
-    };
-  }
-  // Live config access / mutation
-  get defaults() {
-    return this.config;
-  }
-  setConfig(partial = {}) {
-    this.config = this._mergeConfig(partial);
-    this._mergeCache = /* @__PURE__ */ new WeakMap();
-    return this;
-  }
-  // Create a new client sharing this client's config (fresh pools/cookies).
-  clone(overrides = {}) {
-    return new _HTTPClient(this._mergeConfig(overrides));
-  }
-  _getFilenameFromUrl(url) {
-    try {
-      const urlObj = new URL(url);
-      const pathname = urlObj.pathname;
-      return pathname.substring(pathname.lastIndexOf("/") + 1) || "download";
-    } catch {
-      return "download";
-    }
-  }
-  // Close all connections
-  async close() {
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval);
-      this._cleanupInterval = null;
-    }
-    for (const [authority, session] of this.http2Sessions.entries()) {
-      session.close();
-      this.http2Sessions.delete(authority);
-    }
-    this.sessions.clear();
-    destroyAgents(this.connectionPool);
-    this.cache.clear();
-    this._log("info", "All connections closed");
-  }
-};
-var createClient = (config) => new HTTPClient(config);
 
 // lib/scraper.js
 var VOID_TAGS = /* @__PURE__ */ new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
@@ -3306,6 +1571,1797 @@ function parseHTML(html, selectors, options = {}) {
   return [];
 }
 
+// lib/errors.js
+var SwiftlyError = class extends Error {
+  constructor(message, code, context = {}) {
+    super(message);
+    this.name = "SwiftlyError";
+    this.code = code;
+    this.context = context;
+  }
+};
+var ValidationError = class extends SwiftlyError {
+  constructor(message, context = {}) {
+    super(message, "VALIDATION_ERROR", context);
+    this.name = "ValidationError";
+  }
+};
+var RequestError = class extends SwiftlyError {
+  constructor(message, context = {}) {
+    super(message, "REQUEST_ERROR", context);
+    this.name = "RequestError";
+  }
+};
+var ResponseError = class extends SwiftlyError {
+  constructor(message, response, context = {}) {
+    super(message, "RESPONSE_ERROR", { response, ...context });
+    this.name = "ResponseError";
+    this.response = response;
+  }
+};
+var CircuitBreakerError = class extends SwiftlyError {
+  constructor(message, domain, context = {}) {
+    super(message, "CIRCUIT_BREAKER_ERROR", { domain, ...context });
+    this.name = "CircuitBreakerError";
+    this.domain = domain;
+  }
+};
+var TimeoutError = class extends SwiftlyError {
+  constructor(message, type, context = {}) {
+    super(message, "TIMEOUT_ERROR", { type, ...context });
+    this.name = "TimeoutError";
+    this.type = type;
+  }
+};
+var AbortError = class extends SwiftlyError {
+  constructor(message = "Request aborted", context = {}) {
+    super(message, "ABORT_ERROR", context);
+    this.name = "AbortError";
+  }
+};
+
+// lib/client.js
+var undiciRequestFn = null;
+var undiciLoading = null;
+async function loadUndici() {
+  if (undiciRequestFn) return undiciRequestFn;
+  if (!undiciLoading) {
+    undiciLoading = import("undici").then((mod) => {
+      undiciRequestFn = mod.request;
+      return undiciRequestFn;
+    }).catch((e) => {
+      undiciLoading = null;
+      throw e;
+    });
+  }
+  return undiciLoading;
+}
+var VALID_METHODS = Object.freeze({
+  GET: true,
+  POST: true,
+  PUT: true,
+  DELETE: true,
+  PATCH: true,
+  HEAD: true,
+  OPTIONS: true
+});
+var CircuitBreaker = class {
+  constructor(config = {}) {
+    this.state = "CLOSED";
+    this.failureCount = 0;
+    this.lastFailureTime = null;
+    this.config = {
+      failureThreshold: 5,
+      resetTimeout: 6e4,
+      // 1 minuto
+      ...config
+    };
+    this.events = createEventEmitter();
+    this.halfOpenTrialInFlight = false;
+  }
+  async execute(command, domain) {
+    if (this.state === "OPEN") {
+      if (Date.now() - this.lastFailureTime > this.config.resetTimeout) {
+        this.state = "HALF-OPEN";
+        this.halfOpenTrialInFlight = false;
+        this.events.emit("circuit:half-open", { domain });
+      } else {
+        this.events.emit("circuit:rejected", { domain, state: this.state });
+        throw new CircuitBreakerError("Circuit breaker is OPEN", domain);
+      }
+    }
+    if (this.state === "HALF-OPEN") {
+      if (this.halfOpenTrialInFlight) {
+        this.events.emit("circuit:rejected", { domain, state: this.state });
+        throw new CircuitBreakerError("Circuit breaker is HALF-OPEN (trial request in flight)", domain);
+      }
+      this.halfOpenTrialInFlight = true;
+    }
+    try {
+      const result = await command();
+      if (this.state === "HALF-OPEN") {
+        this.state = "CLOSED";
+        this.failureCount = 0;
+        this.halfOpenTrialInFlight = false;
+        this.events.emit("circuit:close", { domain });
+      }
+      return result;
+    } catch (error) {
+      if (this.state === "HALF-OPEN") {
+        this.state = "OPEN";
+        this.halfOpenTrialInFlight = false;
+        this.lastFailureTime = Date.now();
+        this.events.emit("circuit:open", {
+          domain,
+          failureCount: this.failureCount,
+          resetTimeout: this.config.resetTimeout
+        });
+      } else {
+        this.handleFailure(domain);
+      }
+      throw error;
+    }
+  }
+  handleFailure(domain) {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    if (this.failureCount >= this.config.failureThreshold) {
+      this.state = "OPEN";
+      this.events.emit("circuit:open", {
+        domain,
+        failureCount: this.failureCount,
+        resetTimeout: this.config.resetTimeout
+      });
+    }
+  }
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime
+    };
+  }
+};
+var HTTPClient = class _HTTPClient {
+  constructor(config = {}) {
+    this.config = {
+      // Socket timeout is OPT-IN (perf-first, like axios's default of 0):
+      // no per-request timer is created unless `timeout` is set.
+      timeout: null,
+      retries: 3,
+      retryDelay: 1e3,
+      humanize: false,
+      // Performance-first: no artificial delay
+      followRedirects: true,
+      maxRedirects: 5,
+      validateSSL: true,
+      useHttp2: false,
+      debug: false,
+      // Silent by default
+      randomizeHeaders: false,
+      cache: {
+        enabled: true,
+        ttl: 3e5,
+        // 5 minutos
+        maxSize: 1e3
+      },
+      rateLimiting: {
+        enabled: false,
+        // Performance-first: no throttle by default
+        requestsPerSecond: 2,
+        maxDelay: 64e3,
+        minDelay: 1e3
+      },
+      compression: {
+        request: true,
+        response: true,
+        minSize: 1024,
+        // Min bytes to gzip request payload
+        responseMinSize: 0
+        // Min bytes to decompress response
+      },
+      // Timer-based timeouts are OPT-IN (perf-first): `config.timeout`
+      // still guards the socket natively, but the connect/response/idle
+      // timers only run when `timeouts` is explicitly configured.
+      timeouts: null,
+      session: {
+        ttl: 36e5,
+        // 1 hora
+        maxSessions: 100,
+        autoCleanup: true
+      },
+      circuitBreaker: {
+        enabled: false,
+        // Desabilitado por padrão - ativar manualmente
+        failureThreshold: 5,
+        resetTimeout: 6e4
+      },
+      proxy: null,
+      // Proxy configuration { host, port, auth? }
+      baseURL: null,
+      // Base URL for all requests
+      responseEncoding: "utf-8",
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      decompress: true,
+      // Connection pooling (keep-alive Agents per origin)
+      keepAlive: true,
+      maxSockets: Infinity,
+      maxFreeSockets: 256,
+      agent: null,
+      // custom http.Agent / https.Agent override
+      // Auth helpers
+      auth: null,
+      // { username, password } -> Basic auth
+      bearer: null,
+      // -> Authorization: Bearer <token>
+      token: null,
+      // -> Authorization: <token>
+      // Retry refinements
+      retryOn: null,
+      // number[], or (error) => boolean
+      retryBackoff: null,
+      // exponential factor (>=1); default: linear
+      retryJitter: false,
+      // adds randomized jitter to backoff
+      maxRetryAfter: 6e4,
+      // cap for Retry-After honored delay
+      onRetry: null,
+      // (attempt, error, delay) => void
+      // Hooks (informational)
+      onRequest: null,
+      onResponse: null,
+      onError: null,
+      onDownloadProgress: null,
+      onUploadProgress: null,
+      // Streaming
+      stream: false,
+      // Transport: 'http' (default) | 'undici' (optional, lazy-loaded)
+      transport: "http",
+      ...config
+    };
+    this.events = createEventEmitter();
+    this.interceptors = {
+      request: createInterceptorManager(),
+      response: createInterceptorManager()
+    };
+    this.cookieJar = createCookieJar();
+    this.rateLimiter = createRateLimiter(this.config.rateLimiting);
+    this.cache = createCacheStore(this.config.cache);
+    this.connectionPool = /* @__PURE__ */ new Map();
+    this.http2Sessions = /* @__PURE__ */ new Map();
+    this.sessions = /* @__PURE__ */ new Map();
+    this.sessionConfig = this.config.session;
+    this.responseTransformers = /* @__PURE__ */ new Map();
+    this.responseValidators = /* @__PURE__ */ new Map();
+    this.circuitBreakers = /* @__PURE__ */ new Map();
+    this.routeMetrics = /* @__PURE__ */ new Map();
+    this._refreshing = /* @__PURE__ */ new Set();
+    this.pendingRequests = /* @__PURE__ */ new Map();
+    this._mergeCache = /* @__PURE__ */ new WeakMap();
+    this._urlCache = /* @__PURE__ */ new Map();
+    this.metrics = {
+      requestCount: 0,
+      totalTime: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      retries: 0,
+      successCount: 0,
+      errorCount: 0,
+      averageResponseTime: 0,
+      lastRequestTime: 0,
+      totalDataTransferred: 0,
+      http2Requests: 0,
+      redirects: 0,
+      activeSessions: 0,
+      pooledConnections: 0,
+      routeTimes: /* @__PURE__ */ new Map()
+      //Added for route response times
+    };
+    this.pendingRequests = /* @__PURE__ */ new Map();
+    this._registerDefaultTransformers();
+    this._registerDefaultValidators();
+    this._cleanupInterval = null;
+    if (this.config.session.autoCleanup) {
+      this._cleanupInterval = setInterval(() => this._cleanupSessions(), this.config.session.ttl);
+      if (this._cleanupInterval.unref) {
+        this._cleanupInterval.unref();
+      }
+    }
+  }
+  // Método auxiliar para logs melhorado
+  _log(level, ...args) {
+    if (!this.config.debug) return;
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    switch (level) {
+      case "error":
+        console.error(`[Swiftly ${timestamp}]`, ...args);
+        break;
+      case "info":
+        console.info(`[Swiftly ${timestamp}]`, ...args);
+        break;
+      case "debug":
+        console.log(`[Swiftly ${timestamp}]`, ...args);
+        break;
+    }
+  }
+  // Validação de parâmetros
+  _validateRequestParams(method, url, data = null, config = {}) {
+    if (typeof method === "string" && VALID_METHODS[method] && typeof url === "string" && url.charCodeAt(0) === 104 && // 'h' — http(s):// absolute URL
+    (data === null || typeof data === "object" || typeof data === "string") && (config === void 0 || config === null || typeof config === "object") && !(config && config.headers)) {
+      return;
+    }
+    const errors = [];
+    if (!method || typeof method !== "string") {
+      errors.push("Method is required and must be a string");
+    }
+    if (!url) {
+      errors.push("URL is required");
+    } else if (typeof url !== "string") {
+      errors.push("URL must be a string");
+    } else {
+      const isRelativeUrl = url.startsWith("/") || !url.includes("://");
+      const hasBaseURL = this.config && this.config.baseURL;
+      if (isRelativeUrl && !hasBaseURL) {
+        errors.push(`Relative URL "${url}" requires baseURL to be configured`);
+      }
+    }
+    if (data !== null) {
+      if (typeof data !== "object" && typeof data !== "string") {
+        errors.push("Data must be an object, string or null");
+      }
+      if (typeof data === "object" && !Array.isArray(data) && data.constructor !== Object && !(data instanceof Buffer)) {
+        errors.push("Data object must be a plain object, array or Buffer");
+      }
+    }
+    if (config && typeof config !== "object") {
+      errors.push("Config must be an object");
+    }
+    if (config && config.headers) {
+      if (typeof config.headers !== "object") {
+        errors.push("Headers must be an object");
+      } else {
+        for (const [key, value] of Object.entries(config.headers)) {
+          if (typeof value !== "string" && typeof value !== "number") {
+            errors.push(`Header "${key}" must be a string or number, got ${typeof value}`);
+          }
+        }
+      }
+    }
+    if (!VALID_METHODS[method.toUpperCase()]) {
+      errors.push(`Invalid method: ${method}. Valid methods are: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS`);
+    }
+    if (errors.length > 0) {
+      throw new ValidationError(`Validation failed:
+- ${errors.join("\n- ")}`, {
+        method,
+        url,
+        data,
+        config
+      });
+    }
+  }
+  // Método auxiliar para formatar URL
+  _formatUrl(url, params) {
+    if (!this.config.baseURL && !params) {
+      return url;
+    }
+    try {
+      let fullUrl = url;
+      if (this.config.baseURL && !url.includes("://")) {
+        const base = this.config.baseURL.replace(/\/$/, "");
+        const path = url.startsWith("/") ? url : "/" + url;
+        fullUrl = base + path;
+      }
+      const urlObj = new URL(fullUrl);
+      if (params) {
+        const qs = buildQueryString(params);
+        if (qs) {
+          urlObj.search = urlObj.search ? `${urlObj.search}&${qs}` : `?${qs}`;
+        }
+      }
+      return urlObj.toString();
+    } catch (error) {
+      throw new Error(`Invalid URL: ${url}`);
+    }
+  }
+  // Compute an auth identity string used to vary the cache AND dedup keys,
+  // so that responses for different credentials are never shared (prevents
+  // leaking one user's response to another on the same endpoint). Covers the
+  // auth helpers, an explicit Authorization header and a per-request Cookie
+  // header (jar cookies are client-global, so they cannot vary per request).
+  _authVary(config) {
+    const parts = [
+      config.headers && config.headers["Authorization"],
+      config.headers && config.headers["Cookie"],
+      config.auth && config.auth.username,
+      config.auth && config.auth.password,
+      config.bearer,
+      config.token
+    ];
+    return parts.filter(Boolean).join("|");
+  }
+  // Métodos HTTP melhorados
+  async get(url, config = {}) {
+    this._validateRequestParams("GET", url, null, config);
+    this._log("info", `GET request to ${url}`);
+    return this.request("GET", url, null, config).catch((error) => {
+      this._log("error", `GET request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async post(url, data = null, config = {}) {
+    this._validateRequestParams("POST", url, data, config);
+    this._log("info", `POST request to ${url}`);
+    if (config.formData && !data) {
+      throw new ValidationError("Form data is required when formData option is enabled");
+    }
+    return this.request("POST", url, data, config).catch((error) => {
+      this._log("error", `POST request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async put(url, data = null, config = {}) {
+    this._validateRequestParams("PUT", url, data, config);
+    this._log("info", `PUT request to ${url}`);
+    return this.request("PUT", url, data, config).catch((error) => {
+      this._log("error", `PUT request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async delete(url, config = {}) {
+    this._validateRequestParams("DELETE", url, null, config);
+    this._log("info", `DELETE request to ${url}`);
+    return this.request("DELETE", url, null, config).catch((error) => {
+      this._log("error", `DELETE request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async patch(url, data = null, config = {}) {
+    this._validateRequestParams("PATCH", url, data, config);
+    this._log("info", `PATCH request to ${url}`);
+    return this.request("PATCH", url, data, config).catch((error) => {
+      this._log("error", `PATCH request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async head(url, config = {}) {
+    this._validateRequestParams("HEAD", url, null, config);
+    this._log("info", `HEAD request to ${url}`);
+    return this.request("HEAD", url, null, config).catch((error) => {
+      this._log("error", `HEAD request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  async options(url, config = {}) {
+    this._validateRequestParams("OPTIONS", url, null, config);
+    this._log("info", `OPTIONS request to ${url}`);
+    return this.request("OPTIONS", url, null, config).catch((error) => {
+      this._log("error", `OPTIONS request failed: ${error.message}`);
+      throw error;
+    });
+  }
+  _registerDefaultTransformers() {
+    this.responseTransformers.set("json", (data) => {
+      try {
+        const text = data.toString("utf-8");
+        if (!text.length) {
+          throw new Error("Empty response body");
+        }
+        if (text.charCodeAt(0) === 65279) {
+          return JSON.parse(text.slice(1));
+        }
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(`Invalid JSON response: ${e.message}`);
+      }
+    });
+    this.responseTransformers.set("text", (data) => {
+      return data.toString("utf-8");
+    });
+    this.responseTransformers.set("html", (data) => {
+      const text = data.toString("utf-8");
+      if (!text.includes("<!DOCTYPE html>") && !text.includes("<html")) {
+        throw new Error("Invalid HTML response");
+      }
+      return text;
+    });
+    this.responseTransformers.set("buffer", (data) => data);
+  }
+  _registerDefaultValidators() {
+    this.responseValidators.set("json", (data, schema) => {
+      if (!schema) return true;
+      try {
+        for (const [key, type] of Object.entries(schema)) {
+          if (typeof data[key] !== type) {
+            throw new Error(`Invalid type for ${key}`);
+          }
+        }
+        return true;
+      } catch (error) {
+        throw new Error(`Schema validation failed: ${error.message}`);
+      }
+    });
+    this.responseValidators.set("html", (data) => {
+      const text = Buffer.isBuffer(data) ? data.toString("utf-8") : String(data || "");
+      return text.includes("<!DOCTYPE") || text.includes("<html");
+    });
+  }
+  _cleanupSessions() {
+    const now = Date.now();
+    let cleanedCount = 0;
+    for (const [domain, session] of this.sessions.entries()) {
+      if (now - session.lastAccess > this.sessionConfig.ttl) {
+        this.sessions.delete(domain);
+        cleanedCount++;
+      }
+    }
+    if (cleanedCount > 0) {
+      this.metrics.activeSessions = this.sessions.size;
+      this.events.emit("sessions:cleanup", { cleaned: cleanedCount });
+    }
+  }
+  async _getSession(domain) {
+    let session = this.sessions.get(domain);
+    if (this.sessions.size > this.sessionConfig.maxSessions) {
+      for (const [key, sess] of this.sessions.entries()) {
+        if (Date.now() - sess.lastAccess > this.sessionConfig.ttl) {
+          this.sessions.delete(key);
+        }
+      }
+    }
+    if (!session || Date.now() - session.lastAccess > this.sessionConfig.ttl) {
+      session = {
+        cookies: /* @__PURE__ */ new Map(),
+        lastAccess: Date.now(),
+        customHeaders: /* @__PURE__ */ new Map()
+      };
+      this.sessions.set(domain, session);
+    }
+    session.lastAccess = Date.now();
+    return session;
+  }
+  // Bounded URL cache — `new URL()` runs every request; hot endpoints and
+  // polling repeat the same URL string, so cache the parsed object.
+  _parseUrl(url) {
+    const cached = this._urlCache.get(url);
+    if (cached) return cached;
+    const parsed = new URL(url);
+    if (this._urlCache.size > 1024) this._urlCache.clear();
+    this._urlCache.set(url, parsed);
+    return parsed;
+  }
+  _mergeConfig(customConfig) {
+    if (!customConfig || Object.keys(customConfig).length === 0) {
+      return this.config;
+    }
+    let hasNested = false;
+    for (const key in customConfig) {
+      const v = customConfig[key];
+      if (v && typeof v === "object" && !Array.isArray(v) && !(v instanceof Buffer)) {
+        hasNested = true;
+        break;
+      }
+    }
+    if (!hasNested) {
+      const cached = this._mergeCache.get(customConfig);
+      if (cached && cached.snapshot.every(([key, value]) => customConfig[key] === value)) {
+        return cached.merged;
+      }
+      const merged = this._merge(customConfig);
+      this._mergeCache.set(customConfig, { merged, snapshot: Object.entries(customConfig) });
+      return merged;
+    }
+    return this._merge(customConfig);
+  }
+  _merge(customConfig) {
+    const merged = { ...this.config };
+    for (const key in customConfig) {
+      const v = customConfig[key];
+      const base = this.config[key];
+      if (v && typeof v === "object" && !Array.isArray(v) && base && typeof base === "object" && !Array.isArray(base)) {
+        merged[key] = { ...base, ...v };
+      } else {
+        merged[key] = v;
+      }
+    }
+    return merged;
+  }
+  _emit(event, factory) {
+    if (this.events.hasListeners(event)) {
+      this.events.emit(event, factory());
+    }
+  }
+  async request(method, url, data = null, customConfig = {}) {
+    const startTime = Date.now();
+    const config = this._mergeConfig(customConfig);
+    const upperMethod = method.toUpperCase();
+    const isGet = upperMethod === "GET";
+    const formattedUrl = this._formatUrl(url, config.params);
+    if (config.cache.enabled && isGet && !config.stream) {
+      const cacheKey = this.cache.getCacheKey(upperMethod, formattedUrl, data, {
+        ...config.cache,
+        vary: this._authVary(config)
+      });
+      if (config.cache.staleWhileRevalidate) {
+        const peeked = this.cache.peek(cacheKey);
+        if (peeked) {
+          this.metrics.cacheHits++;
+          this._emit(events.CACHE_HIT, () => ({ url: formattedUrl, stale: peeked.stale }));
+          if (peeked.stale && !this._refreshing.has(cacheKey)) {
+            this._refreshing.add(cacheKey);
+            this._refreshCacheEntry(cacheKey, upperMethod, formattedUrl, data, config).catch(() => {
+            }).finally(() => this._refreshing.delete(cacheKey));
+          }
+          return peeked.value;
+        }
+      } else {
+        const cachedResponse = this.cache.get(cacheKey);
+        if (cachedResponse) {
+          this.metrics.cacheHits++;
+          this._emit(events.CACHE_HIT, () => ({ url: formattedUrl }));
+          return cachedResponse;
+        }
+      }
+      this.metrics.cacheMisses++;
+      this._emit(events.CACHE_MISS, () => ({ url: formattedUrl }));
+    }
+    const urlObj = this._parseUrl(formattedUrl);
+    const routeKey = config.trackRouteTimes ? `${upperMethod} ${urlObj.pathname}` : null;
+    const dedupKey = isGet && !config.stream ? `${upperMethod}:${formattedUrl}:${this._authVary(config)}` : null;
+    if (dedupKey && config.deduplicate !== false) {
+      const pending = this.pendingRequests.get(dedupKey);
+      if (pending) {
+        this._log("debug", `Deduplicating request: ${dedupKey}`);
+        return pending;
+      }
+    }
+    this._emit(events.REQUEST_START, () => ({ method: upperMethod, url: formattedUrl, config }));
+    const requestPromise = this._executeRequest(upperMethod, formattedUrl, data, config, startTime, routeKey, urlObj);
+    if (dedupKey && config.deduplicate !== false) {
+      this.pendingRequests.set(dedupKey, requestPromise);
+      requestPromise.catch(() => {
+      }).finally(() => this.pendingRequests.delete(dedupKey));
+    }
+    return requestPromise;
+  }
+  // Background refresh for stale-while-revalidate cache entries.
+  async _refreshCacheEntry(cacheKey, method, url, data, config) {
+    try {
+      const result = await this._executeRequest(
+        method,
+        url,
+        data,
+        { ...config, cache: { enabled: false }, stream: false },
+        Date.now(),
+        null,
+        new URL(url)
+      );
+      if (result !== void 0 && result !== null) {
+        this.cache.set(cacheKey, result, config.cache.ttl);
+      }
+    } catch (_) {
+    }
+  }
+  async _executeRequest(method, url, data, config, startTime, routeKey, urlObj) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    if (config.signal && config.signal.aborted) {
+      throw new AbortError();
+    }
+    if (config.rateLimiting.enabled) {
+      try {
+        await this.rateLimiter.checkLimit(urlObj.hostname, config.rateLimiting);
+      } catch (error) {
+        this.events.emit(events.RATE_LIMIT, { url, error: error.message });
+        throw error;
+      }
+    }
+    const streamMode = !!config.stream;
+    if (streamMode && config.retries > 1) {
+      config = { ...config, retries: 1 };
+    }
+    const options = {
+      method,
+      hostname: urlObj.hostname,
+      port: urlObj.port ? Number(urlObj.port) : void 0,
+      path: urlObj.pathname + urlObj.search,
+      headers: generateHeaders(config),
+      // Only create a native socket timer when a timeout is configured.
+      timeout: typeof config.timeout === "number" ? config.timeout : void 0,
+      rejectUnauthorized: config.validateSSL,
+      config
+      // Store original config for interceptors
+    };
+    if (config.agent) {
+      options.agent = config.agent;
+    } else if (!config.transport || config.transport === "http") {
+      const hostKey = `${urlObj.hostname}:${urlObj.port || (urlObj.protocol === "https:" ? 443 : 80)}`;
+      options.agent = getAgent(urlObj.protocol, hostKey, config, this.connectionPool);
+    }
+    const cookies = this.cookieJar.getCookies(urlObj.href);
+    if (cookies) {
+      options.headers["Cookie"] = cookies;
+    }
+    if (!options.headers["Authorization"]) {
+      if (config.auth && config.auth.username !== void 0) {
+        options.headers["Authorization"] = "Basic " + Buffer.from(`${config.auth.username}:${config.auth.password || ""}`).toString("base64");
+      } else if (config.bearer) {
+        options.headers["Authorization"] = `Bearer ${config.bearer}`;
+      } else if (config.token) {
+        options.headers["Authorization"] = config.token;
+      }
+    }
+    if (data && config.formData) {
+      const formData = await this._createFormData(data);
+      data = formData.data;
+      options.headers["Content-Type"] = `multipart/form-data; boundary=${formData.boundary}`;
+    } else if (data && typeof data === "object" && !Buffer.isBuffer(data) && !(data instanceof Readable) && !options.headers["Content-Type"]) {
+      options.headers["Content-Type"] = "application/json";
+    }
+    if (data && typeof data === "object" && !Buffer.isBuffer(data) && !(data instanceof Readable) && !options.headers["Content-Encoding"]) {
+      const compressedData = await this._compressData(data);
+      data = compressedData.data;
+      options.headers["Content-Encoding"] = compressedData.encoding;
+    }
+    let finalOptions = options;
+    if (this.interceptors.request.handlers.length > 0) {
+      try {
+        finalOptions = await this.interceptors.request.executeRequestChain(options);
+      } catch (error) {
+        throw new RequestError("Request interceptor error", {
+          original: error,
+          options
+        });
+      }
+    }
+    let attempt = 0;
+    let redirectCount = config.redirectCount || 0;
+    let circuitBreaker = null;
+    if (config.circuitBreaker && config.circuitBreaker.enabled) {
+      circuitBreaker = this.circuitBreakers.get(urlObj.hostname);
+      if (!circuitBreaker) {
+        circuitBreaker = new CircuitBreaker(config.circuitBreaker);
+        for (const event of ["circuit:open", "circuit:close", "circuit:half-open", "circuit:rejected"]) {
+          circuitBreaker.events.on(event, (payload) => this.events.emit(event, payload));
+        }
+        this.circuitBreakers.set(urlObj.hostname, circuitBreaker);
+      }
+    }
+    if (config.humanize) {
+      await delay(Math.random() * 1e3 + 500, config.signal);
+    }
+    if (config.onRequest) {
+      try {
+        config.onRequest({ method, url, options: finalOptions });
+      } catch (_) {
+      }
+    }
+    const useHttp2 = config.useHttp2 && urlObj.protocol === "https:" && !streamMode;
+    const useUndici = config.transport === "undici" && !useHttp2 && !streamMode;
+    const performRequest = useUndici ? () => this._undiciRequest(urlObj, finalOptions, data) : useHttp2 ? () => this._makeHttp2Request(urlObj, finalOptions, data) : () => this._makeRequest(urlObj.protocol, finalOptions, data);
+    while (attempt < config.retries) {
+      try {
+        const response = circuitBreaker ? await circuitBreaker.execute(performRequest, urlObj.hostname) : await performRequest();
+        if (useHttp2) this.metrics.http2Requests++;
+        if (circuitBreaker && response.status >= 500) {
+          circuitBreaker.handleFailure(urlObj.hostname);
+        }
+        if (config.followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
+          if (redirectCount >= config.maxRedirects) {
+            const err = new Error(`Max redirects exceeded (${config.maxRedirects})`);
+            err.code = "MAX_REDIRECTS";
+            err._noRetry = true;
+            throw err;
+          }
+          redirectCount++;
+          this.metrics.redirects++;
+          const location = response.headers.location;
+          this.events.emit(events.REDIRECT, { from: url, to: location });
+          const redirectUrl = location.includes("://") ? location : new URL(location, url).href;
+          if (response.data && typeof response.data.destroy === "function") {
+            response.data.destroy();
+          }
+          return this.request(method, redirectUrl, data, {
+            ...config,
+            params: void 0,
+            redirectCount,
+            deduplicate: false
+          });
+        }
+        const responseCookies = response.headers["set-cookie"];
+        if (Array.isArray(responseCookies)) {
+          responseCookies.forEach((cookie) => {
+            this.cookieJar.setCookie(urlObj.hostname, cookie);
+          });
+        }
+        const processedResponse = this.interceptors.response.handlers.length > 0 ? await this.interceptors.response.executeResponseChain(response) : response;
+        const requestTime = Date.now() - startTime;
+        processedResponse.duration = requestTime;
+        const bodyLength = processedResponse.data ? processedResponse.data.length ?? 0 : 0;
+        this.metrics.requestCount++;
+        this.metrics.totalTime += requestTime;
+        this.metrics.successCount++;
+        this.metrics.lastRequestTime = requestTime;
+        this.metrics.totalDataTransferred += bodyLength;
+        if (config.trackRouteTimes) {
+          let routeTime = this.routeMetrics.get(routeKey) || { count: 0, totalTime: 0 };
+          routeTime.count++;
+          routeTime.totalTime += requestTime;
+          this.routeMetrics.set(routeKey, routeTime);
+          this.metrics.routeTimes.set(routeKey, routeTime.totalTime / routeTime.count);
+        }
+        this._emit(events.REQUEST_END, () => ({
+          method,
+          url,
+          status: processedResponse.status,
+          time: requestTime,
+          size: bodyLength
+        }));
+        if (method === "HEAD") {
+          return processedResponse.headers;
+        }
+        if (method === "OPTIONS") {
+          return processedResponse.headers;
+        }
+        if (streamMode) {
+          if (config.onResponse) {
+            try {
+              config.onResponse(processedResponse.data, processedResponse);
+            } catch (_) {
+            }
+          }
+          return processedResponse.data;
+        }
+        const processed = this._processResponse(processedResponse, config.responseType);
+        const result = processed && typeof processed.then === "function" ? await processed : processed;
+        if (config.responseSchema && !streamMode && config.responseType !== "raw") {
+          const type = detectResponseType(processedResponse.headers["content-type"] || "");
+          const validator = this.responseValidators.get(type);
+          if (validator) {
+            validator(result, config.responseSchema);
+          }
+        }
+        if (config.cache.enabled && method === "GET" && processedResponse.status === 200 && !streamMode) {
+          const cacheKey = this.cache.getCacheKey(method, url, data, {
+            ...config.cache,
+            vary: this._authVary(config)
+          });
+          this.cache.set(cacheKey, result, config.cache.ttl);
+          this._emit(events.CACHE_STORE, () => ({ url }));
+        }
+        if (config.onResponse) {
+          try {
+            config.onResponse(result, processedResponse);
+          } catch (_) {
+          }
+        }
+        return result;
+      } catch (error) {
+        if (error._noRetry || error instanceof AbortError) {
+          this.metrics.errorCount++;
+          this.events.emit(events.REQUEST_ERROR, error);
+          if (config.onError) {
+            try {
+              config.onError(error);
+            } catch (_) {
+            }
+          }
+          throw error;
+        }
+        const status = ((_a = error.response) == null ? void 0 : _a.status) || ((_c = (_b = error.context) == null ? void 0 : _b.response) == null ? void 0 : _c.status);
+        let shouldRetry;
+        if (config.retryOn) {
+          shouldRetry = Array.isArray(config.retryOn) ? status !== void 0 && config.retryOn.includes(status) : config.retryOn(error) === true;
+        } else {
+          shouldRetry = !(status >= 400 && status < 500 && status !== 429);
+        }
+        if (!shouldRetry) {
+          this.metrics.errorCount++;
+          this.events.emit(events.REQUEST_ERROR, error);
+          if (config.onError) {
+            try {
+              config.onError(error);
+            } catch (_) {
+            }
+          }
+          throw error;
+        }
+        attempt++;
+        this.metrics.retries++;
+        this.metrics.errorCount++;
+        if (!(error instanceof SwiftlyError)) {
+          error = new RequestError(error.message, {
+            original: error,
+            method,
+            url,
+            config
+          });
+        }
+        let nextDelay = config.retryBackoff ? config.retryDelay * Math.pow(config.retryBackoff, attempt - 1) : config.retryDelay * attempt;
+        const retryAfter = ((_e = (_d = error.response) == null ? void 0 : _d.headers) == null ? void 0 : _e["retry-after"]) ?? ((_h = (_g = (_f = error.context) == null ? void 0 : _f.response) == null ? void 0 : _g.headers) == null ? void 0 : _h["retry-after"]);
+        if (retryAfter) {
+          const secs = parseInt(retryAfter, 10);
+          if (!isNaN(secs)) {
+            nextDelay = Math.min(secs * 1e3, config.maxRetryAfter ?? Infinity);
+          }
+        }
+        if (config.retryJitter) {
+          const jitterMax = config.retryJitter === true ? nextDelay : config.retryJitter;
+          nextDelay += Math.random() * jitterMax;
+        }
+        if (config.onRetry) {
+          try {
+            config.onRetry(attempt, error, nextDelay);
+          } catch (_) {
+          }
+        }
+        this.events.emit(events.RETRY_ATTEMPT, {
+          attempt,
+          error: error.message,
+          nextRetryDelay: nextDelay
+        });
+        if (attempt === config.retries) {
+          this.events.emit(events.REQUEST_ERROR, error);
+          if (config.onError) {
+            try {
+              config.onError(error);
+            } catch (_) {
+            }
+          }
+          throw error;
+        }
+        await delay(nextDelay, config.signal);
+      }
+    }
+  }
+  async _makeHttp2Request(urlObj, options, data) {
+    const authority = `${urlObj.hostname}:${urlObj.port || 443}`;
+    let session = this.http2Sessions.get(authority);
+    if (!session || session.destroyed) {
+      session = http22.connect(urlObj.href, {
+        rejectUnauthorized: options.rejectUnauthorized
+      });
+      this.http2Sessions.set(authority, session);
+      session.on("error", () => {
+        this.http2Sessions.delete(authority);
+      });
+      session.on("goaway", () => {
+        this.http2Sessions.delete(authority);
+      });
+    }
+    return new Promise((resolve, reject) => {
+      var _a;
+      const headers = { ...options.headers };
+      delete headers["connection"];
+      delete headers["keep-alive"];
+      delete headers["transfer-encoding"];
+      delete headers["upgrade-insecure-requests"];
+      delete headers["host"];
+      const req = session.request({
+        ...headers,
+        ":method": options.method,
+        ":path": options.path,
+        ":authority": urlObj.host,
+        ":scheme": "https"
+      });
+      const signal = (_a = options.config) == null ? void 0 : _a.signal;
+      if (signal) {
+        if (signal.aborted) {
+          req.destroy(new AbortError());
+        } else {
+          const onAbort = () => req.destroy(new AbortError());
+          signal.addEventListener("abort", onAbort, { once: true });
+          req.once("close", () => signal.removeEventListener("abort", onAbort));
+        }
+      }
+      const chunks = [];
+      let totalBytes = 0;
+      let responseHeaders = null;
+      let responseStatus = null;
+      req.on("response", (headers2) => {
+        responseStatus = headers2[":status"];
+        responseHeaders = { ...headers2 };
+        delete responseHeaders[":status"];
+        delete responseHeaders[":method"];
+        delete responseHeaders[":path"];
+        delete responseHeaders[":authority"];
+        delete responseHeaders[":scheme"];
+      });
+      req.on("data", (chunk) => {
+        chunks.push(chunk);
+        totalBytes += chunk.length;
+        if (responseHeaders) {
+          const total = parseInt(responseHeaders["content-length"], 10) || 0;
+          if (total && this.events.hasListeners(events.PROGRESS)) {
+            this.events.emit(events.PROGRESS, {
+              loaded: totalBytes,
+              total,
+              percent: totalBytes / total * 100
+            });
+          }
+        }
+      });
+      req.on("end", () => {
+        let body = Buffer.concat(chunks);
+        const encoding = responseHeaders && responseHeaders["content-encoding"];
+        const contentLength = parseInt(responseHeaders && responseHeaders["content-length"], 10) || 0;
+        const cfg = options.config || this.config;
+        if (cfg.compression.response && cfg.decompress !== false && contentLength >= cfg.compression.responseMinSize && encoding) {
+          try {
+            if (encoding === "gzip") {
+              body = zlib.gunzipSync(body);
+            } else if (encoding === "deflate") {
+              body = zlib.inflateSync(body);
+            } else if (encoding === "br") {
+              body = zlib.brotliDecompressSync(body);
+            }
+          } catch (e) {
+            reject(new RequestError("Decompression failed", { original: e, options }));
+            return;
+          }
+        }
+        resolve({
+          data: body,
+          headers: responseHeaders,
+          status: responseStatus,
+          config: options
+        });
+      });
+      req.on("error", reject);
+      if (data) {
+        if (data instanceof Readable) {
+          data.pipe(req);
+        } else {
+          const payload = Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data);
+          req.write(payload);
+        }
+      }
+      req.end();
+    });
+  }
+  _setupTimeouts(req, options) {
+    const configured = options.config && options.config.timeouts;
+    if (!configured) return;
+    const timeouts = {
+      connect: configured.connect || 5e3,
+      response: configured.response || 3e4,
+      idle: configured.idle || 6e4
+    };
+    let connectTimer = null;
+    let responseTimer = null;
+    let idleTimer = null;
+    const clearAll = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      if (responseTimer) {
+        clearTimeout(responseTimer);
+        responseTimer = null;
+      }
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    req.once("close", clearAll);
+    req.once("error", clearAll);
+    connectTimer = setTimeout(() => {
+      req.destroy(new TimeoutError("Connection timeout", "connect"));
+    }, timeouts.connect);
+    req.once("socket", () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+      responseTimer = setTimeout(() => {
+        req.destroy(new TimeoutError("Response timeout", "response"));
+      }, timeouts.response);
+    });
+    req.once("response", (res) => {
+      if (responseTimer) {
+        clearTimeout(responseTimer);
+        responseTimer = null;
+      }
+      const isStreaming = !!(options.config && options.config.stream);
+      if (isStreaming) return;
+      const startIdle = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+        }
+        idleTimer = setTimeout(() => {
+          req.destroy(new TimeoutError("Idle timeout", "idle"));
+        }, timeouts.idle);
+      };
+      startIdle();
+      res.on("data", startIdle);
+      res.once("end", () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+      });
+      res.once("error", clearAll);
+    });
+  }
+  _prepareHostname(options) {
+    if (!options.hostname || !options.hostname.includes(":")) return;
+    options.hostname = options.hostname.replace(/^\[|\]$/g, "");
+    const ipv6Pattern = /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|::)$/;
+    if (!ipv6Pattern.test(options.hostname)) {
+      throw new ValidationError("Invalid IPv6 address format", { hostname: options.hostname });
+    }
+    options.hostname = `[${options.hostname}]`;
+  }
+  _attachSignal(req, options) {
+    var _a;
+    const signal = (_a = options.config) == null ? void 0 : _a.signal;
+    if (!signal) return;
+    if (signal.aborted) {
+      req.destroy(new AbortError());
+      return;
+    }
+    const onAbort = () => {
+      this.events.emit(events.ABORT, { url: options.path });
+      req.destroy(new AbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    req.once("close", () => signal.removeEventListener("abort", onAbort));
+  }
+  _enhanceError(error, options, protocol) {
+    if (error instanceof SwiftlyError) return error;
+    switch (error.code) {
+      case "ECONNREFUSED":
+        return new RequestError("Connection refused", { original: error, options, protocol });
+      case "ENOTFOUND":
+        return new RequestError("Host not found", { original: error, options, protocol });
+      case "ECONNRESET":
+        return new RequestError("Connection reset", { original: error, options, protocol });
+      case "ETIMEDOUT":
+        return new TimeoutError("Connection timed out", "connect", { original: error, options, protocol });
+      default:
+        return new RequestError(error.message, { original: error, options, protocol });
+    }
+  }
+  _sendPayload(req, data, config = {}) {
+    if (!data) {
+      req.end();
+      return;
+    }
+    if (data instanceof Readable) {
+      let loaded = 0;
+      data.on("data", (chunk) => {
+        loaded += chunk.length;
+        const progress = { loaded, total: 0, percent: 0 };
+        if (config.onUploadProgress) config.onUploadProgress(progress);
+        this._emit(events.UPLOAD_PROGRESS, () => progress);
+      });
+      data.on("error", (err) => req.destroy(err));
+      data.pipe(req);
+      return;
+    }
+    const payload = Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data);
+    const bytes = Buffer.byteLength(payload);
+    req.write(payload, () => {
+      const progress = { loaded: bytes, total: bytes, percent: 100 };
+      if (config.onUploadProgress) config.onUploadProgress(progress);
+      this._emit(events.UPLOAD_PROGRESS, () => progress);
+    });
+    req.end();
+  }
+  _handleResponseStream(res, options, resolve, reject) {
+    const requestCfg = options.config || this.config;
+    const isHead = options.method === "HEAD" || options.method === "OPTIONS";
+    if (isHead) {
+      resolve({
+        data: Buffer.alloc(0),
+        headers: res.headers,
+        status: res.statusCode,
+        config: options
+      });
+      return;
+    }
+    if (requestCfg.stream) {
+      const encoding2 = res.headers["content-encoding"];
+      let stream2 = res;
+      if (requestCfg.compression.response && encoding2 && requestCfg.decompress !== false) {
+        if (encoding2 === "gzip") {
+          stream2 = res.pipe(zlib.createGunzip());
+        } else if (encoding2 === "deflate") {
+          stream2 = res.pipe(zlib.createInflate());
+        } else if (encoding2 === "br") {
+          stream2 = res.pipe(zlib.createBrotliDecompress());
+        }
+      }
+      stream2.headers = res.headers;
+      stream2.status = res.statusCode;
+      stream2.total = parseInt(res.headers["content-length"], 10) || 0;
+      stream2.on("error", (error) => {
+        reject(new RequestError("Stream error", { original: error, options }));
+      });
+      resolve({
+        data: stream2,
+        headers: res.headers,
+        status: res.statusCode,
+        config: options
+      });
+      return;
+    }
+    const chunks = [];
+    let stream = res;
+    const contentLength = parseInt(res.headers["content-length"], 10) || 0;
+    const encoding = res.headers["content-encoding"];
+    const isDecompressing = requestCfg.compression.response && requestCfg.decompress !== false && encoding && contentLength >= requestCfg.compression.responseMinSize;
+    if (isDecompressing) {
+      if (encoding === "gzip") {
+        stream = res.pipe(zlib.createGunzip());
+      } else if (encoding === "deflate") {
+        stream = res.pipe(zlib.createInflate());
+      } else if (encoding === "br") {
+        stream = res.pipe(zlib.createBrotliDecompress());
+      }
+    }
+    let totalBytes = contentLength;
+    let receivedBytes = 0;
+    const canPrealloc = !isDecompressing && contentLength > 0;
+    let prealloc = canPrealloc ? Buffer.allocUnsafe(contentLength) : null;
+    let writeOffset = 0;
+    const hasProgress = totalBytes > 0 && (requestCfg.onDownloadProgress || this.events.hasListeners(events.PROGRESS) || this.events.hasListeners(events.DOWNLOAD_PROGRESS));
+    stream.on("data", (chunk) => {
+      receivedBytes += chunk.length;
+      if (prealloc) {
+        if (writeOffset === 0 && receivedBytes === contentLength) {
+          prealloc = chunk;
+          writeOffset = contentLength;
+        } else {
+          chunk.copy(prealloc, writeOffset);
+          writeOffset += chunk.length;
+        }
+      } else {
+        chunks.push(chunk);
+      }
+      if (hasProgress) {
+        const progress = {
+          loaded: receivedBytes,
+          total: totalBytes,
+          percent: receivedBytes / totalBytes * 100
+        };
+        if (this.events.hasListeners(events.PROGRESS)) {
+          this.events.emit(events.PROGRESS, progress);
+        }
+        if (this.events.hasListeners(events.DOWNLOAD_PROGRESS)) {
+          this.events.emit(events.DOWNLOAD_PROGRESS, progress);
+        }
+        if (requestCfg.onDownloadProgress) requestCfg.onDownloadProgress(progress);
+      }
+    });
+    stream.on("end", () => {
+      const data = prealloc ? writeOffset === contentLength ? prealloc : prealloc.subarray(0, writeOffset) : Buffer.concat(chunks);
+      resolve({
+        data,
+        headers: res.headers,
+        status: res.statusCode,
+        config: options
+        // Include original config for error handling
+      });
+    });
+    stream.on("error", (error) => {
+      reject(new RequestError("Stream error", {
+        original: error,
+        options
+      }));
+    });
+  }
+  _makeRequest(protocol, options, data) {
+    if (options.config && options.config.proxy) {
+      return this._makeProxiedRequest(protocol, options, data);
+    }
+    return new Promise((resolve, reject) => {
+      try {
+        this._prepareHostname(options);
+      } catch (error) {
+        return reject(new RequestError("Invalid IPv6 address", {
+          original: error,
+          options,
+          protocol
+        }));
+      }
+      const client = protocol === "https:" ? https2 : http2;
+      const req = client.request(options, (res) => {
+        this._handleResponseStream(res, options, resolve, reject);
+      });
+      req.once("socket", () => {
+        this._emit(events.SOCKET_ASSIGNED, () => ({
+          host: options.hostname,
+          port: options.port || (protocol === "https:" ? 443 : 80)
+        }));
+      });
+      this._attachSignal(req, options);
+      this._setupTimeouts(req, options);
+      req.on("error", (error) => {
+        reject(this._enhanceError(error, options, protocol));
+      });
+      this._sendPayload(req, data, options.config || {});
+    });
+  }
+  _makeProxiedRequest(protocol, options, data) {
+    return new Promise((resolve, reject) => {
+      const proxy = options.config.proxy;
+      const proxyHost = proxy.host;
+      const proxyPort = proxy.port || (protocol === "https:" ? 443 : 80);
+      let proxyAuth = null;
+      if (proxy.auth) {
+        const creds = typeof proxy.auth === "string" ? proxy.auth : `${proxy.auth.username}:${proxy.auth.password || ""}`;
+        proxyAuth = "Basic " + Buffer.from(creds).toString("base64");
+      }
+      const handler = (res) => this._handleResponseStream(res, options, resolve, reject);
+      if (protocol === "https:") {
+        const connectReq = http2.request({
+          host: proxyHost,
+          port: proxyPort,
+          method: "CONNECT",
+          path: `${options.hostname}:${options.port || 443}`,
+          headers: proxyAuth ? { "Proxy-Authorization": proxyAuth } : {}
+        });
+        connectReq.on("connect", (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy();
+            reject(new RequestError(`Proxy CONNECT failed: HTTP ${res.statusCode}`, { options, protocol }));
+            return;
+          }
+          this.events.emit(events.PROXY_CONNECT, { host: options.hostname, proxyHost });
+          const servername = String(options.hostname).replace(/^\[|\]$/g, "");
+          const tlsSocket = tls.connect({
+            socket,
+            servername,
+            rejectUnauthorized: options.rejectUnauthorized
+          });
+          const req = https2.request({
+            ...options,
+            createConnection: () => tlsSocket,
+            agent: false
+          }, handler);
+          this._attachSignal(req, options);
+          this._setupTimeouts(req, options);
+          req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
+          this._sendPayload(req, data, options.config || {});
+        });
+        connectReq.on("error", (error) => {
+          reject(new RequestError("Proxy connection failed", { original: error, options, protocol }));
+        });
+        connectReq.end();
+      } else {
+        const target = `http://${options.hostname}:${options.port || 80}${options.path}`;
+        const headers = { ...options.headers, Host: `${options.hostname}:${options.port || 80}` };
+        if (proxyAuth) headers["Proxy-Authorization"] = proxyAuth;
+        const req = http2.request({
+          host: proxyHost,
+          port: proxyPort,
+          method: options.method,
+          path: target,
+          headers,
+          agent: false
+        }, handler);
+        this._attachSignal(req, options);
+        this._setupTimeouts(req, options);
+        req.on("error", (error) => reject(this._enhanceError(error, options, protocol)));
+        this._sendPayload(req, data, options.config || {});
+      }
+    });
+  }
+  _processResponse(response, responseType) {
+    if (response.status >= 400) {
+      throw new ResponseError(`HTTP Error ${response.status}`, response);
+    }
+    const contentType = response.headers["content-type"] || "";
+    const type = responseType && responseType !== "raw" ? responseType : detectResponseType(contentType);
+    const validTypes = ["json", "text", "html", "buffer", "raw"];
+    if (responseType && !validTypes.includes(responseType)) {
+      this._log("error", `Invalid responseType: ${responseType}, falling back to buffer`);
+    }
+    const transformer = this.responseTransformers.get(type) || this.responseTransformers.get("buffer");
+    if (!transformer) {
+      this._log("error", `No transformer found for type: ${type}, using buffer`);
+      return response.data;
+    }
+    const finish = (data) => {
+      if (responseType === "raw") {
+        return {
+          data,
+          status: response.status,
+          headers: response.headers,
+          config: response.config,
+          duration: response.duration
+        };
+      }
+      return data;
+    };
+    try {
+      const result = transformer(response.data, response.headers);
+      if (result && typeof result.then === "function") {
+        return result.then(
+          finish,
+          (error) => {
+            error.response = response;
+            error.type = type;
+            throw error;
+          }
+        );
+      }
+      return finish(result);
+    } catch (error) {
+      error.response = response;
+      error.type = type;
+      throw error;
+    }
+  }
+  async _compressData(data) {
+    let jsonStr;
+    try {
+      jsonStr = JSON.stringify(data);
+    } catch (error) {
+      throw new ValidationError(`Cannot serialize data: ${error.message}`, { data: typeof data });
+    }
+    if (!this.config.compression.request) {
+      return { data: jsonStr, encoding: "identity" };
+    }
+    if (jsonStr.length < this.config.compression.minSize) {
+      return { data: jsonStr, encoding: "identity" };
+    }
+    return new Promise((resolve, reject) => {
+      zlib.gzip(jsonStr, {
+        level: 6,
+        // Balanced compression
+        memLevel: 8
+        // Moderate memory usage
+      }, (err, compressed) => {
+        if (err) {
+          resolve({ data: jsonStr, encoding: "identity" });
+        } else {
+          resolve({ data: compressed, encoding: "gzip" });
+        }
+      });
+    });
+  }
+  async _createFormData(data) {
+    if (!data || typeof data !== "object") {
+      throw new ValidationError("FormData must be an object");
+    }
+    const boundary = `----WebKitFormBoundary${Math.random().toString(36).slice(2)}`;
+    const chunks = [];
+    for (const [key, value] of Object.entries(data)) {
+      if (!key || typeof key !== "string") {
+        throw new ValidationError("FormData keys must be non-empty strings");
+      }
+      chunks.push(Buffer.from(`\r
+--${boundary}\r
+`));
+      if (Buffer.isBuffer(value) || value && (value.buffer instanceof ArrayBuffer || value.buffer instanceof SharedArrayBuffer || Buffer.isBuffer(value.buffer) || ArrayBuffer.isView(value.buffer))) {
+        const filename = value.name || "file";
+        let content;
+        if (Buffer.isBuffer(value)) {
+          content = value;
+        } else if (Buffer.isBuffer(value.buffer) || ArrayBuffer.isView(value.buffer)) {
+          const view = value.buffer;
+          content = Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+        } else if (value.buffer instanceof ArrayBuffer || value.buffer instanceof SharedArrayBuffer) {
+          content = Buffer.from(value.buffer, value.byteOffset || 0, value.byteLength || value.buffer.byteLength);
+        } else {
+          content = Buffer.from(String(value));
+        }
+        chunks.push(Buffer.from(`Content-Disposition: form-data; name="${key}"; filename="${filename}"\r
+`));
+        chunks.push(Buffer.from(`Content-Type: ${value.type || "application/octet-stream"}\r
+\r
+`));
+        chunks.push(content);
+      } else {
+        chunks.push(Buffer.from(`Content-Disposition: form-data; name="${key}"\r
+\r
+`));
+        chunks.push(Buffer.from(String(value)));
+      }
+    }
+    chunks.push(Buffer.from(`\r
+--${boundary}--\r
+`));
+    return {
+      boundary,
+      data: Buffer.concat(chunks)
+    };
+  }
+  // GraphQL support
+  async query(url, { query, variables = {} } = {}, config = {}) {
+    let endpoint = url;
+    let queryData = query;
+    let vars = variables;
+    if (typeof url === "string" && (url.trim().startsWith("{") || url.trim().startsWith("query") || url.trim().startsWith("mutation"))) {
+      queryData = url;
+      vars = query || {};
+      endpoint = config.endpoint || "/graphql";
+    }
+    const data = {
+      query: queryData,
+      variables: vars
+    };
+    const response = await this.post(endpoint, data, {
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      ...config
+    });
+    if (response && response.data) {
+      return response.data;
+    }
+    if (response && response.errors && response.errors.length > 0) {
+      const error = new Error(response.errors[0].message);
+      error.graphqlErrors = response.errors;
+      throw error;
+    }
+    return response;
+  }
+  // Server-Sent Events support
+  async subscribe(url, callbacks = {}, config = {}) {
+    const { onMessage, onError, onOpen } = callbacks;
+    const urlObj = new URL(url);
+    const options = {
+      ...this.config,
+      ...config,
+      headers: {
+        ...generateHeaders(config),
+        "Accept": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
+      }
+    };
+    if (!options.headers["Authorization"]) {
+      if (options.auth && options.auth.username !== void 0) {
+        options.headers["Authorization"] = "Basic " + Buffer.from(`${options.auth.username}:${options.auth.password || ""}`).toString("base64");
+      } else if (options.bearer) {
+        options.headers["Authorization"] = `Bearer ${options.bearer}`;
+      } else if (options.token) {
+        options.headers["Authorization"] = options.token;
+      }
+    }
+    const cookies = this.cookieJar.getCookies(urlObj.href);
+    if (cookies) {
+      options.headers["Cookie"] = cookies;
+    }
+    return new Promise((resolve, reject) => {
+      const client = urlObj.protocol === "https:" ? https2 : http2;
+      const reqOptions = { ...options };
+      if (typeof reqOptions.timeout !== "number") delete reqOptions.timeout;
+      const req = client.request(urlObj, reqOptions, (res) => {
+        if (res.statusCode !== 200) {
+          const err = new Error(`SSE connection failed: ${res.statusCode}`);
+          if (onError) onError(err);
+          reject(err);
+          return;
+        }
+        res.setEncoding("utf8");
+        let buffer = "";
+        if (onOpen) onOpen();
+        resolve(() => req.destroy());
+        res.on("data", (chunk) => {
+          buffer += chunk;
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+          lines.forEach((line) => {
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6);
+              try {
+                const parsedData = JSON.parse(data);
+                if (onMessage) onMessage(parsedData);
+              } catch (e) {
+                if (onMessage) onMessage(data);
+              }
+            }
+          });
+        });
+        res.on("error", (error) => {
+          if (onError) onError(error);
+          reject(error);
+        });
+      });
+      req.on("error", (error) => {
+        if (onError) onError(error);
+        reject(error);
+      });
+      req.end();
+    });
+  }
+  // Event handling methods
+  on(event, callback) {
+    return this.events.on(event, callback);
+  }
+  off(event, callback) {
+    return this.events.off(event, callback);
+  }
+  // Get current metrics
+  getMetrics() {
+    return {
+      ...this.metrics,
+      averageResponseTime: this.metrics.requestCount ? this.metrics.totalTime / this.metrics.requestCount : 0,
+      activeSessions: this.sessions.size,
+      pooledConnections: this.connectionPool.size,
+      http2Sessions: this.http2Sessions.size,
+      cacheSize: this.cache.getStats().size,
+      circuitBreakers: Array.from(this.circuitBreakers.entries()).map(([domain, cb]) => ({
+        domain,
+        state: cb.getState()
+      }))
+    };
+  }
+  // Clear all caches
+  clearCache() {
+    this.cache.clear();
+    this._log("info", "Cache cleared");
+  }
+  // Reset circuit breakers
+  resetCircuitBreakers(domain = null) {
+    if (domain) {
+      this.circuitBreakers.delete(domain);
+      this._log("info", `Circuit breaker reset for domain: ${domain}`);
+    } else {
+      this.circuitBreakers.clear();
+      this._log("info", "All circuit breakers reset");
+    }
+  }
+  // Batch requests
+  async batch(requests) {
+    if (!Array.isArray(requests)) {
+      throw new ValidationError("Batch requests must be an array");
+    }
+    return Promise.all(requests.map((req) => {
+      const { method = "GET", url, data, config } = req;
+      const methodLower = method.toLowerCase();
+      const methodsWithBody = ["post", "put", "patch"];
+      if (methodsWithBody.includes(methodLower)) {
+        return this[methodLower](url, data, config).catch((err) => ({ error: err }));
+      } else {
+        return this[methodLower](url, config).catch((err) => ({ error: err }));
+      }
+    }));
+  }
+  // Fetch a page as text and parse it with CSS-like selectors in one step.
+  // Convenience wrapper used by the public API (instance + static forms).
+  async scrape(url, selector, config = {}) {
+    const html = await this.get(url, { ...config, responseType: "text", cache: { enabled: false } });
+    return parseHTML(html, selector, config);
+  }
+  // Download file helper - resolves with the raw Buffer (consistent with responseType: 'buffer')
+  async download(url, config = {}) {
+    return this.get(url, { ...config, responseType: "buffer" });
+  }
+  // Stream a download directly to disk with progress reporting.
+  async downloadTo(url, filePath, config = {}) {
+    const stream = await this.get(url, { ...config, stream: true });
+    const { onProgress } = config;
+    const total = stream.total || 0;
+    let loaded = 0;
+    if (typeof stream.status === "number" && stream.status >= 400) {
+      try {
+        stream.destroy();
+      } catch {
+      }
+      throw new ResponseError(`HTTP Error ${stream.status}`, {
+        status: stream.status,
+        headers: stream.headers || {}
+      });
+    }
+    return new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream(filePath);
+      stream.on("data", (chunk) => {
+        loaded += chunk.length;
+        if (onProgress) {
+          onProgress({ loaded, total, percent: total ? loaded / total * 100 : 0 });
+        }
+      });
+      stream.on("error", (err) => {
+        ws.destroy();
+        reject(err);
+      });
+      ws.on("error", reject);
+      ws.on("finish", () => resolve({ path: filePath, bytes: loaded }));
+      stream.pipe(ws);
+    });
+  }
+  // Optional undici transport (lazy-loaded, keeps the default path zero-dep)
+  async _undiciRequest(urlObj, options, data) {
+    var _a, _b, _c, _d;
+    let request;
+    try {
+      request = await loadUndici();
+    } catch (e) {
+      throw new ValidationError(
+        "transport: 'undici' requires the optional dependency 'undici' to be installed",
+        { transport: "undici" }
+      );
+    }
+    const body = data ? Buffer.isBuffer(data) ? data : typeof data === "string" ? data : JSON.stringify(data) : void 0;
+    let result;
+    try {
+      result = await request(urlObj.href, {
+        method: options.method,
+        headers: options.headers,
+        body,
+        signal: (_a = options.config) == null ? void 0 : _a.signal,
+        headersTimeout: (_c = (_b = options.config) == null ? void 0 : _b.timeouts) == null ? void 0 : _c.response,
+        bodyTimeout: typeof ((_d = options.config) == null ? void 0 : _d.timeout) === "number" ? options.config.timeout : void 0,
+        maxRedirections: 0
+        // redirects are handled by swiftly
+      });
+    } catch (e) {
+      if (e && (e.name === "AbortError" || e.code === "UND_ERR_ABORTED" || e.code === "ABORT_ERR")) {
+        throw new AbortError();
+      }
+      throw e;
+    }
+    const { statusCode, headers: resHeaders, body: resBody } = result;
+    let buf = Buffer.from(await resBody.arrayBuffer());
+    const cfg = options.config || this.config;
+    const encoding = resHeaders["content-encoding"];
+    if (cfg.compression.response && cfg.decompress !== false && encoding) {
+      try {
+        if (encoding === "gzip") {
+          buf = zlib.gunzipSync(buf);
+        } else if (encoding === "deflate") {
+          buf = zlib.inflateSync(buf);
+        } else if (encoding === "br") {
+          buf = zlib.brotliDecompressSync(buf);
+        }
+      } catch (e) {
+        throw new RequestError("Decompression failed", { original: e, options });
+      }
+    }
+    return {
+      data: buf,
+      headers: resHeaders,
+      status: statusCode,
+      config: options
+    };
+  }
+  // Live config access / mutation
+  get defaults() {
+    return this.config;
+  }
+  setConfig(partial = {}) {
+    this.config = this._mergeConfig(partial);
+    this._mergeCache = /* @__PURE__ */ new WeakMap();
+    return this;
+  }
+  // Create a new client sharing this client's config (fresh pools/cookies).
+  clone(overrides = {}) {
+    return new _HTTPClient(this._mergeConfig(overrides));
+  }
+  _getFilenameFromUrl(url) {
+    try {
+      const urlObj = new URL(url);
+      const pathname = urlObj.pathname;
+      return pathname.substring(pathname.lastIndexOf("/") + 1) || "download";
+    } catch {
+      return "download";
+    }
+  }
+  // Close all connections
+  async close() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+    for (const [authority, session] of this.http2Sessions.entries()) {
+      session.close();
+      this.http2Sessions.delete(authority);
+    }
+    this.sessions.clear();
+    destroyAgents(this.connectionPool);
+    this.cache.clear();
+    this._log("info", "All connections closed");
+  }
+};
+var createClient = (config) => new HTTPClient(config);
+
 // lib/extract.js
 function resolveUrl(href, baseUrl) {
   try {
@@ -4146,16 +4202,6 @@ export {
  * @license MIT
  */
 /**
- * Custom Error Classes
- * @author hiudy
- * @license MIT
- */
-/**
- * HTTP Client Implementation
- * @author hiudy
- * @license MIT
- */
-/**
  * Advanced HTML Scraper — selector engine v2
  *
  * A zero-dependency, lightweight HTML parser + CSS-like selector engine.
@@ -4165,6 +4211,16 @@ export {
  *
  * Note: it is intentionally lighter than a full DOM. For very heavy scraping
  * pair Swiftly with a full parser.
+ * @author hiudy
+ * @license MIT
+ */
+/**
+ * Custom Error Classes
+ * @author hiudy
+ * @license MIT
+ */
+/**
+ * HTTP Client Implementation
  * @author hiudy
  * @license MIT
  */
