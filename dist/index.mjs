@@ -2493,12 +2493,18 @@ var NAMED_ENTITIES = {
   iacute: "\xED"
 };
 var ENTITY_RE = /&(#[xX]?[0-9a-fA-F]+|[a-zA-Z0-9]+);/g;
+function decodeNumericEntity(code) {
+  if (code === 0 || code > 1114111 || code >= 55296 && code <= 57343) {
+    return "\uFFFD";
+  }
+  return String.fromCodePoint(code);
+}
 function decodeEntities(text) {
   if (!text || !text.includes("&")) return text;
   return text.replace(ENTITY_RE, (match, entity) => {
     if (entity[0] === "#") {
       const code = entity[1] === "x" || entity[1] === "X" ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
-      return isNaN(code) ? match : String.fromCodePoint(code);
+      return isNaN(code) ? match : decodeNumericEntity(code);
     }
     return NAMED_ENTITIES[entity.toLowerCase()] || match;
   });
@@ -2719,28 +2725,50 @@ function buildTree(tokens) {
   assignIndices(root);
   return root;
 }
-function assignIndices(node) {
-  const siblings = node.children;
-  const typeCounters = /* @__PURE__ */ new Map();
-  for (let i = 0; i < siblings.length; i++) {
-    const child = siblings[i];
-    child.index = i + 1;
-    const t = child.tag;
-    const c = (typeCounters.get(t) || 0) + 1;
-    typeCounters.set(t, c);
-    child.typeIndex = c;
-    assignIndices(child);
+function assignIndices(root) {
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    const siblings = node.children;
+    const typeCounters = /* @__PURE__ */ new Map();
+    for (let i = 0; i < siblings.length; i++) {
+      const child = siblings[i];
+      child.index = i + 1;
+      const t = child.tag;
+      const c = (typeCounters.get(t) || 0) + 1;
+      typeCounters.set(t, c);
+      child.typeIndex = c;
+      stack.push(child);
+    }
   }
+}
+function collectAll(root) {
+  const out = [];
+  const stack = [...root.children].reverse();
+  while (stack.length) {
+    const n = stack.pop();
+    out.push(n);
+    for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+  }
+  return out;
 }
 function elementText(node) {
   let out = "";
-  for (const part of node.parts) {
+  const stack = [{ node, idx: 0 }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const parts = frame.node.parts;
+    if (frame.idx >= parts.length) {
+      stack.pop();
+      continue;
+    }
+    const part = parts[frame.idx++];
     if (part.kind === "text") {
       out += part.text;
     } else {
       const c = part.node;
       if (c.tag === "script" || c.tag === "style" || c.tag === "noscript") continue;
-      out += elementText(c);
+      stack.push({ node: c, idx: 0 });
     }
   }
   return out;
@@ -2748,10 +2776,29 @@ function elementText(node) {
 function outerHTML(node) {
   if (node.selfClosing) return node.raw;
   let out = node.raw;
-  for (const part of node.parts) {
-    out += part.kind === "text" ? part.text : outerHTML(part.node);
+  const stack = [{ node, idx: 0 }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    const parts = frame.node.parts;
+    if (frame.idx >= parts.length) {
+      const n = frame.node;
+      if (!n.selfClosing) out += `</${n.tag}>`;
+      stack.pop();
+      continue;
+    }
+    const part = parts[frame.idx++];
+    if (part.kind === "text") {
+      out += part.text;
+    } else {
+      const c = part.node;
+      if (c.selfClosing) {
+        out += c.raw;
+      } else {
+        out += c.raw;
+        stack.push({ node: c, idx: 0 });
+      }
+    }
   }
-  out += `</${node.tag}>`;
   return out;
 }
 function previousSiblingElement(node) {
@@ -3087,16 +3134,6 @@ function matchLeft(node, steps, idx) {
   }
   return false;
 }
-function collectAll(root) {
-  const out = [];
-  (function walk(n) {
-    for (const c of n.children) {
-      out.push(c);
-      walk(c);
-    }
-  })(root);
-  return out;
-}
 function queryAllSteps(doc, steps) {
   const lastCompound = steps[steps.length - 1].simple;
   const out = [];
@@ -3110,37 +3147,50 @@ function queryAllSteps(doc, steps) {
 }
 function toElement(node) {
   if (node._el) return node._el;
-  const el = {
-    html: outerHTML(node),
-    content: elementText(node).trim(),
-    attributes: { ...node.attrs },
-    children: node.children.map(toElement),
-    tag: node.tag,
-    index: node.index,
-    text: () => elementText(node).trim(),
-    attr: (name) => name in node.attrs ? node.attrs[name] : null,
-    find: (sel) => findWithin(node, sel),
-    parent: () => node.parent && node.parent.tag !== "#root" ? toElement(node.parent) : null,
-    closest: (sel) => closestWithin(node, sel),
-    next: () => {
-      const s = nextSiblingElement(node);
-      return s ? toElement(s) : null;
-    },
-    prev: () => {
-      const s = previousSiblingElement(node);
-      return s ? toElement(s) : null;
-    },
-    data: () => {
-      const out = {};
-      for (const [k, v] of Object.entries(node.attrs)) {
-        if (k.startsWith("data-")) out[k.slice(5)] = v;
+  const order = [];
+  const stack = [node];
+  while (stack.length) {
+    const n = stack.pop();
+    order.push(n);
+    for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+  }
+  for (let i = order.length - 1; i >= 0; i--) {
+    const n = order[i];
+    if (n._el) continue;
+    const el = {
+      attributes: { ...n.attrs },
+      children: n.children.map((c) => c._el),
+      tag: n.tag,
+      index: n.index,
+      text: () => elementText(n).trim(),
+      attr: (name) => name in n.attrs ? n.attrs[name] : null,
+      find: (sel) => findWithin(n, sel),
+      parent: () => n.parent && n.parent.tag !== "#root" ? toElement(n.parent) : null,
+      closest: (sel) => closestWithin(n, sel),
+      next: () => {
+        const s = nextSiblingElement(n);
+        return s ? toElement(s) : null;
+      },
+      prev: () => {
+        const s = previousSiblingElement(n);
+        return s ? toElement(s) : null;
+      },
+      data: () => {
+        const out = {};
+        for (const [k, v] of Object.entries(n.attrs)) {
+          if (k.startsWith("data-")) out[k.slice(5)] = v;
+        }
+        return out;
       }
-      return out;
-    }
-  };
-  Object.defineProperty(el, "_node", { value: node, enumerable: false });
-  node._el = el;
-  return el;
+    };
+    let htmlCache;
+    let contentCache;
+    Object.defineProperty(el, "html", { get: () => htmlCache ?? (htmlCache = outerHTML(n)), enumerable: true });
+    Object.defineProperty(el, "content", { get: () => contentCache ?? (contentCache = elementText(n).trim()), enumerable: true });
+    Object.defineProperty(el, "_node", { value: n, enumerable: false });
+    n._el = el;
+  }
+  return node._el;
 }
 function findWithin(node, sel) {
   const groups = compileSelector(sel);
@@ -3372,6 +3422,66 @@ function extractJSON(html) {
   }
   return out;
 }
+function stripBlocks(html, tag) {
+  const lower = html.toLowerCase();
+  const openPrefix = `<${tag}`;
+  const closePrefix = `</${tag}>`;
+  let out = "";
+  let searchFrom = 0;
+  const n = html.length;
+  while (searchFrom < n) {
+    const open = lower.indexOf(openPrefix, searchFrom);
+    if (open === -1) {
+      out += html.slice(searchFrom);
+      break;
+    }
+    let tagEnd = -1;
+    let quote = null;
+    for (let j = open + 1; j < n; j++) {
+      const ch = html[j];
+      if (quote) {
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === ">") {
+        tagEnd = j;
+        break;
+      }
+    }
+    if (tagEnd === -1) {
+      out += html.slice(searchFrom);
+      break;
+    }
+    const close = lower.indexOf(closePrefix, tagEnd + 1);
+    if (close === -1) {
+      out += html.slice(searchFrom);
+      break;
+    }
+    out += html.slice(searchFrom, open);
+    searchFrom = close + closePrefix.length;
+  }
+  return out;
+}
+function stripComments(html) {
+  let out = "";
+  let searchFrom = 0;
+  const n = html.length;
+  while (searchFrom < n) {
+    const open = html.indexOf("<!--", searchFrom);
+    if (open === -1) {
+      out += html.slice(searchFrom);
+      break;
+    }
+    const close = html.indexOf("-->", open + 4);
+    if (close === -1) {
+      out += html.slice(searchFrom);
+      break;
+    }
+    out += html.slice(searchFrom, open);
+    searchFrom = close + 3;
+  }
+  return out;
+}
 function sanitizeHtml(html, options = {}) {
   const {
     stripTags = ["script", "style", "iframe", "object", "embed", "form", "noscript", "link", "meta"],
@@ -3379,9 +3489,9 @@ function sanitizeHtml(html, options = {}) {
   } = options;
   let out = Buffer.isBuffer(html) ? html.toString("utf-8") : String(html);
   for (const tag of stripTags) {
-    out = out.replace(new RegExp(`<${tag}[\\s\\S]*?<\\/${tag}>`, "gi"), "");
+    out = stripBlocks(out, tag);
   }
-  out = out.replace(/<!--[\s\S]*?-->/g, "");
+  out = stripComments(out);
   if (!allowEventHandlers) {
     out = out.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]*)/gi, "");
   }
@@ -3435,12 +3545,18 @@ ${t.trim()}
 
 // lib/xml.js
 var XML_NAMED = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\xA0" };
+function decodeNumericEntity2(code) {
+  if (code === 0 || code > 1114111 || code >= 55296 && code <= 57343) {
+    return "\uFFFD";
+  }
+  return String.fromCodePoint(code);
+}
 function decodeXML(text) {
   if (!text || !text.includes("&")) return text;
   return text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z0-9]+);/g, (m, e) => {
     if (e[0] === "#") {
       const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-      return isNaN(code) ? m : String.fromCodePoint(code);
+      return isNaN(code) ? m : decodeNumericEntity2(code);
     }
     return XML_NAMED[e.toLowerCase()] || m;
   });
@@ -3587,21 +3703,40 @@ function parseXMLTree(xml) {
   return buildTree2(tokenizeXML(source));
 }
 function nodeToObject(node) {
-  const obj = {};
-  if (node.attrs && Object.keys(node.attrs).length) {
-    obj.$ = { ...node.attrs };
+  const memo = /* @__PURE__ */ new Map();
+  const stack = [node];
+  while (stack.length) {
+    const n = stack.pop();
+    if (memo.has(n)) continue;
+    let ready = true;
+    for (const c of n.children) {
+      if (!memo.has(c)) ready = false;
+    }
+    if (!ready) {
+      stack.push(n);
+      for (const c of n.children) {
+        if (!memo.has(c)) stack.push(c);
+      }
+      continue;
+    }
+    const obj = {};
+    if (n.attrs && Object.keys(n.attrs).length) {
+      obj.$ = { ...n.attrs };
+    }
+    const grouped = {};
+    for (const child of n.children) {
+      const childObj = memo.get(child);
+      if (!grouped[child.tag]) grouped[child.tag] = [];
+      grouped[child.tag].push(childObj);
+    }
+    for (const [tag, list] of Object.entries(grouped)) {
+      obj[tag] = list.length === 1 ? list[0] : list;
+    }
+    const text = n.text ? n.text.trim() : "";
+    if (text) obj["#text"] = text;
+    memo.set(n, obj);
   }
-  const grouped = {};
-  for (const child of node.children) {
-    if (!grouped[child.tag]) grouped[child.tag] = [];
-    grouped[child.tag].push(child);
-  }
-  for (const [tag, list] of Object.entries(grouped)) {
-    obj[tag] = list.length === 1 ? nodeToObject(list[0]) : list.map(nodeToObject);
-  }
-  const text = node.text ? node.text.trim() : "";
-  if (text) obj["#text"] = text;
-  return obj;
+  return memo.get(node);
 }
 function attrString(attrs) {
   return Object.entries(attrs).map(([k, v]) => ` ${k}="${escapeXML(v)}"`).join("");
