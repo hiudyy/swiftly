@@ -179,4 +179,42 @@ describe('CookieJar', () => {
         expect(jar.getCookies('https://example.com/')).toBe('sid=abc');
         expect(jar.getCookies('http://example.com/')).toBe('');
     });
+    it('honors Max-Age as a relative expiry', async () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Max-Age=1');
+        expect(jar.getCookies('example.com')).toBe('sid=abc');
+        await new Promise(r => setTimeout(r, 1100));
+        expect(jar.getCookies('example.com')).toBe('');
+    });
+    it('Max-Age=0 expires a cookie immediately', () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Max-Age=0');
+        expect(jar.getCookies('example.com')).toBe('');
+    });
+    it('prefers Max-Age over Expires', () => {
+        const jar = createCookieJar();
+        const far = new Date(Date.now() + 600000).toUTCString();
+        jar.setCookie('example.com', `sid=abc; Expires=${far}; Max-Age=5`);
+        const expires = new Date(jar.toJSON()['example.com'][0].expires).getTime();
+        expect(expires).toBeLessThan(Date.now() + 10000);
+        expect(expires).toBeGreaterThan(Date.now() - 1000);
+    });
+    it('does not send a Path=/api cookie to /apikey (RFC 6265)', () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Path=/api');
+        expect(jar.getCookies('https://example.com/api')).toBe('sid=abc');
+        expect(jar.getCookies('https://example.com/api/users')).toBe('sid=abc');
+        expect(jar.getCookies('https://example.com/apikey')).toBe('');
+        expect(jar.getCookies('https://example.com/')).toBe('');
+    });
+    it('toJSON / fromJSON preserves the cookie path', () => {
+        const jar = createCookieJar();
+        jar.setCookie('example.com', 'sid=abc; Path=/admin');
+        const json = jar.toJSON();
+        expect(json['example.com'][0].path).toBe('/admin');
+        const jar2 = createCookieJar();
+        jar2.fromJSON(json);
+        expect(jar2.getCookies('https://example.com/admin')).toBe('sid=abc');
+        expect(jar2.getCookies('https://example.com/public')).toBe('');
+    });
 });

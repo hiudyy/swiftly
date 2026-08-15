@@ -55,6 +55,20 @@ describe('xml.parseXML', () => {
     it('returns empty object for empty input', () => {
         expect(parseXML('')).toEqual({});
     });
+    it('skips DOCTYPE declarations without polluting the tree', () => {
+        const xml = '<?xml version="1.0"?>\n<!DOCTYPE rss SYSTEM "http://example.com/rss.dtd">\n<rss version="2.0"><channel><title>Feed</title></channel></rss>';
+        // Single root is unwrapped (existing convention); the DOCTYPE must not
+        // become a bogus node or leak garbage into the output.
+        expect(parseXML(xml)).toEqual({
+            $: { version: '2.0' },
+            channel: { title: { '#text': 'Feed' } }
+        });
+    });
+    it('skips internal DTD subsets (and stays XXE-immune)', () => {
+        const xml = '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root><a>1</a></root>';
+        // The declaration is dropped entirely — no entity expansion happens.
+        expect(parseXML(xml)).toEqual({ a: { '#text': '1' } });
+    });
 });
 
 describe('xml.parseXMLTree', () => {
@@ -137,6 +151,13 @@ describe('xml.parseRSS', () => {
     });
     it('returns empty array for non-rss', () => {
         expect(parseRSS('<root/>')).toEqual([]);
+    });
+    it('parses a feed with a DOCTYPE preamble', () => {
+        const rss = '<?xml version="1.0"?><!DOCTYPE rss><rss version="2.0"><channel><title>Ch</title><item><title>P1</title><link>http://x/1</link></item></channel></rss>';
+        const items = parseRSS(rss);
+        expect(items.length).toBe(1);
+        expect(items[0].title).toBe('P1');
+        expect(items[0].link).toBe('http://x/1');
     });
 });
 

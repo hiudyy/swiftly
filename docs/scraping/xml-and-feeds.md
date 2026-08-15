@@ -21,6 +21,9 @@ Shape rules:
 - Repeated child tags become arrays; single occurrences become objects.
 - Attribute values with no `=` become `true`.
 - Comments, processing instructions and the XML declaration are skipped.
+- Declarations (`<!DOCTYPE ...>`, including internal DTD subsets) are
+  skipped and never expanded — the parser performs **no entity expansion**, so
+  it is immune to XXE by design.
 - CDATA becomes text.
 - Mismatched close tags are tolerated (implicit close up the stack).
 

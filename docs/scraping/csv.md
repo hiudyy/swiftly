@@ -27,6 +27,9 @@ parseCSV('name,age\nAda,36\nBob,41');
 - Headers are trimmed; values are left as strings.
 - Missing trailing fields become `null`.
 - Empty input returns `[]`.
+- **Duplicate header names collect their values into an array** — no silent
+  data loss: `parseCSV('a,a,b\n1,2,3')` → `[{ a: ['1','2'], b: '3' }]`.
+  (Common with spreadsheet exports that have merged/renamed columns.)
 
 ### Array mode (header: false)
 
@@ -41,6 +44,10 @@ parseCSV('a,b\n1,2', { header: false });
 - Escaped quotes (`""` → `"`).
 - CRLF and lone `\r` line endings.
 - A trailing line without a newline is still emitted.
+
+> A quote inside an already-started unquoted field is treated as a quote
+> delimiter (RFC 4180 requires quoting the whole field), so malformed input
+> like `foo"bar",baz` parses as `foobar`, `baz` — it is not kept literal.
 
 ## toCSV(rows, options)
 

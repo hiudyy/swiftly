@@ -62,6 +62,11 @@ const api2 = swiftly({ deduplicate: false }); // disabled for all requests
 
 Deduplication is skipped for stream requests.
 
+Dedup keys are **auth-aware**: concurrent GETs to the same URL with different
+credentials — different `Authorization`/tokens or per-request `Cookie`
+headers — are never merged. Each caller gets its own response; only identical
+concurrent GETs share a single network request.
+
 ## trackRouteTimes — per-route metrics
 
 Opt in to per-route timing metrics:

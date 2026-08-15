@@ -6,13 +6,7 @@ import {
     isValidUrl,
     deepMerge,
     parseUrl,
-    formatBytes,
-    formatDuration,
-    generateId,
-    retryWithBackoff,
-    withTimeout,
-    safeJsonParse,
-    chunk
+    safeJsonParse
 } from '../lib/utils.js';
 
 describe('utils.detectResponseType', () => {
@@ -139,89 +133,6 @@ describe('utils.parseUrl', () => {
     });
 });
 
-describe('utils.formatBytes', () => {
-    it('handles zero', () => {
-        expect(formatBytes(0)).toBe('0 Bytes');
-    });
-    it('formats bytes', () => {
-        expect(formatBytes(512)).toBe('512 Bytes');
-    });
-    it('formats KB', () => {
-        expect(formatBytes(1024)).toBe('1 KB');
-    });
-    it('formats MB and GB', () => {
-        expect(formatBytes(1024 * 1024 * 5)).toBe('5 MB');
-        expect(formatBytes(1024 * 1024 * 1024 * 2)).toBe('2 GB');
-    });
-    it('respects decimals argument', () => {
-        expect(formatBytes(1536, 1)).toBe('1.5 KB');
-    });
-    it('formats TB for very large values', () => {
-        expect(formatBytes(1024 * 1024 * 1024 * 1024)).toBe('1 TB');
-    });
-});
-
-describe('utils.formatDuration', () => {
-    it('formats milliseconds', () => {
-        expect(formatDuration(500)).toBe('500ms');
-    });
-    it('formats seconds', () => {
-        expect(formatDuration(1500)).toBe('1.50s');
-    });
-    it('formats minutes', () => {
-        expect(formatDuration(120000)).toBe('2.00m');
-    });
-});
-
-describe('utils.generateId', () => {
-    it('produces a non-empty string', () => {
-        expect(typeof generateId()).toBe('string');
-        expect(generateId().length).toBeGreaterThan(0);
-    });
-    it('produces unique values', () => {
-        const ids = new Set(Array.from({ length: 100 }, () => generateId()));
-        expect(ids.size).toBe(100);
-    });
-});
-
-describe('utils.retryWithBackoff', () => {
-    it('returns the value on first success', async () => {
-        await expect(retryWithBackoff(async () => 42)).resolves.toBe(42);
-    });
-    it('retries until success', async () => {
-        let n = 0;
-        const r = await retryWithBackoff(async () => {
-            n++;
-            if (n < 3) throw new Error('fail');
-            return 'ok';
-        }, 5, 1);
-        expect(r).toBe('ok');
-        expect(n).toBe(3);
-    });
-    it('throws the last error after exhausting retries', async () => {
-        let n = 0;
-        await expect(retryWithBackoff(async () => {
-            n++;
-            throw new Error('always');
-        }, 2, 1)).rejects.toThrow('always');
-        expect(n).toBe(2);
-    });
-});
-
-describe('utils.withTimeout', () => {
-    it('resolves when the promise resolves first', async () => {
-        await expect(withTimeout(Promise.resolve('done'), 100)).resolves.toBe('done');
-    });
-    it('rejects when the timer fires first', async () => {
-        const p = new Promise((resolve) => setTimeout(resolve, 100));
-        await expect(withTimeout(p, 10)).rejects.toThrow('timed out');
-    });
-    it('uses a custom message', async () => {
-        const p = new Promise((resolve) => setTimeout(resolve, 100));
-        await expect(withTimeout(p, 10, 'custom')).rejects.toThrow('custom');
-    });
-});
-
 describe('utils.safeJsonParse', () => {
     it('parses valid JSON', () => {
         expect(safeJsonParse('{"a":1}')).toEqual({ a: 1 });
@@ -233,20 +144,5 @@ describe('utils.safeJsonParse', () => {
     it('parses arrays and primitives', () => {
         expect(safeJsonParse('[1,2,3]')).toEqual([1, 2, 3]);
         expect(safeJsonParse('"str"')).toBe('str');
-    });
-});
-
-describe('utils.chunk', () => {
-    it('splits an array into chunks', () => {
-        expect(chunk([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
-    });
-    it('returns an empty array for empty input', () => {
-        expect(chunk([], 3)).toEqual([]);
-    });
-    it('returns whole array when size is larger', () => {
-        expect(chunk([1, 2], 5)).toEqual([[1, 2]]);
-    });
-    it('handles exact division', () => {
-        expect(chunk([1, 2, 3, 4], 2)).toEqual([[1, 2], [3, 4]]);
     });
 });

@@ -359,6 +359,9 @@ var CookieJar = class {
     }
     const cookieDomain = entry.domain ? String(entry.domain).toLowerCase().replace(/^\./, "") : reqDomain;
     const hostOnly = !entry.domain;
+    if (!this.cookies.has(cookieDomain)) {
+      this.cookies.set(cookieDomain, /* @__PURE__ */ new Map());
+    }
     this.cookies.get(cookieDomain).set(entry.name, {
       value: String(entry.value),
       expires: entry.expires instanceof Date ? entry.expires : entry.expires ? new Date(entry.expires) : null,
@@ -367,7 +370,7 @@ var CookieJar = class {
       sameSite: entry.sameSite || "Lax",
       _domain: cookieDomain,
       _hostOnly: hostOnly,
-      _path: entry.path || "/"
+      _path: this._normalizePath(entry.path)
     });
     return this;
   }
@@ -404,7 +407,7 @@ var CookieJar = class {
         sameSite: sameSiteAttr || "Lax",
         _domain: cookieDomain,
         _hostOnly: hostOnly,
-        _path: pathAttr || "/"
+        _path: this._normalizePath(pathAttr)
       });
     } catch (error) {
     }
@@ -424,7 +427,7 @@ var CookieJar = class {
     for (const [domainKey, cookies] of this.cookies) {
       for (const [name, data] of cookies) {
         if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
-        if (!pathname.startsWith(data._path)) continue;
+        if (!this._pathMatches(pathname, data._path)) continue;
         if (data.secure && protocol !== "https:") continue;
         out.push(`${name}=${data.value}`);
       }
@@ -444,7 +447,7 @@ var CookieJar = class {
     for (const [domainKey, cookies] of this.cookies) {
       for (const [name, data] of cookies) {
         if (!this._domainMatches(hostname, data._domain, data._hostOnly)) continue;
-        if (!pathname.startsWith(data._path)) continue;
+        if (!this._pathMatches(pathname, data._path)) continue;
         out.push({ name, ...data });
       }
     }
@@ -477,7 +480,7 @@ var CookieJar = class {
         httpOnly: data.httpOnly,
         secure: data.secure,
         sameSite: data.sameSite,
-        path: data.path || "/"
+        path: data._path || "/"
       }));
     }
     return out;
@@ -507,8 +510,30 @@ var CookieJar = class {
     }
     return this;
   }
+  // RFC 6265: a Path attribute that does not start with '/' is ignored and
+  // the default '/' applies.
+  _normalizePath(path) {
+    const p = path || "/";
+    return p.startsWith("/") ? p : "/";
+  }
+  // RFC 6265 §5.1.4 path matching: cookie-path must be a prefix of the
+  // request path AND either end with '/' or be followed by '/' in the
+  // request path — otherwise a Path=/api cookie would also match /apikey.
+  _pathMatches(requestPath, cookiePath) {
+    if (requestPath === cookiePath) return true;
+    if (!requestPath.startsWith(cookiePath)) return false;
+    return cookiePath.endsWith("/") || requestPath[cookiePath.length] === "/";
+  }
   _getExpiryFromCookie(cookie) {
-    const expires = cookie.split(";").find((part) => part.trim().toLowerCase().startsWith("expires="));
+    const parts = cookie.split(";");
+    const maxAge = parts.find((p) => p.trim().toLowerCase().startsWith("max-age="));
+    if (maxAge) {
+      const seconds = parseInt(maxAge.split("=")[1], 10);
+      if (!Number.isNaN(seconds)) {
+        return seconds <= 0 ? /* @__PURE__ */ new Date(0) : new Date(Date.now() + seconds * 1e3);
+      }
+    }
+    const expires = parts.find((p) => p.trim().toLowerCase().startsWith("expires="));
     return expires ? new Date(expires.split("=")[1]) : null;
   }
   _getSameSiteFromCookie(cookie) {
@@ -839,27 +864,48 @@ var CircuitBreaker = class {
       ...config
     };
     this.events = createEventEmitter();
+    this.halfOpenTrialInFlight = false;
   }
   async execute(command, domain) {
     if (this.state === "OPEN") {
       if (Date.now() - this.lastFailureTime > this.config.resetTimeout) {
         this.state = "HALF-OPEN";
+        this.halfOpenTrialInFlight = false;
         this.events.emit("circuit:half-open", { domain });
       } else {
         this.events.emit("circuit:rejected", { domain, state: this.state });
         throw new CircuitBreakerError("Circuit breaker is OPEN", domain);
       }
     }
+    if (this.state === "HALF-OPEN") {
+      if (this.halfOpenTrialInFlight) {
+        this.events.emit("circuit:rejected", { domain, state: this.state });
+        throw new CircuitBreakerError("Circuit breaker is HALF-OPEN (trial request in flight)", domain);
+      }
+      this.halfOpenTrialInFlight = true;
+    }
     try {
       const result = await command();
       if (this.state === "HALF-OPEN") {
         this.state = "CLOSED";
         this.failureCount = 0;
+        this.halfOpenTrialInFlight = false;
         this.events.emit("circuit:close", { domain });
       }
       return result;
     } catch (error) {
-      this.handleFailure(domain);
+      if (this.state === "HALF-OPEN") {
+        this.state = "OPEN";
+        this.halfOpenTrialInFlight = false;
+        this.lastFailureTime = Date.now();
+        this.events.emit("circuit:open", {
+          domain,
+          failureCount: this.failureCount,
+          resetTimeout: this.config.resetTimeout
+        });
+      } else {
+        this.handleFailure(domain);
+      }
       throw error;
     }
   }
@@ -1109,7 +1155,7 @@ var HTTPClient = class _HTTPClient {
     }
     try {
       let fullUrl = url;
-      if (this.config.baseURL && !url.startsWith("http")) {
+      if (this.config.baseURL && !url.includes("://")) {
         const base = this.config.baseURL.replace(/\/$/, "");
         const path = url.startsWith("/") ? url : "/" + url;
         fullUrl = base + path;
@@ -1126,12 +1172,15 @@ var HTTPClient = class _HTTPClient {
       throw new Error(`Invalid URL: ${url}`);
     }
   }
-  // Compute an auth identity string used to vary the cache key, so that
-  // responses for different credentials are never shared (prevents
-  // leaking one user's cached response to another on the same endpoint).
+  // Compute an auth identity string used to vary the cache AND dedup keys,
+  // so that responses for different credentials are never shared (prevents
+  // leaking one user's response to another on the same endpoint). Covers the
+  // auth helpers, an explicit Authorization header and a per-request Cookie
+  // header (jar cookies are client-global, so they cannot vary per request).
   _authVary(config) {
     const parts = [
       config.headers && config.headers["Authorization"],
+      config.headers && config.headers["Cookie"],
       config.auth && config.auth.username,
       config.auth && config.auth.password,
       config.bearer,
@@ -1349,16 +1398,15 @@ var HTTPClient = class _HTTPClient {
     }
     const urlObj = this._parseUrl(formattedUrl);
     const routeKey = config.trackRouteTimes ? `${upperMethod} ${urlObj.pathname}` : null;
-    if (isGet && config.deduplicate !== false && !config.stream) {
-      const dedupKey2 = `${upperMethod}:${formattedUrl}`;
-      const pending = this.pendingRequests.get(dedupKey2);
+    const dedupKey = isGet && !config.stream ? `${upperMethod}:${formattedUrl}:${this._authVary(config)}` : null;
+    if (dedupKey && config.deduplicate !== false) {
+      const pending = this.pendingRequests.get(dedupKey);
       if (pending) {
-        this._log("debug", `Deduplicating request: ${dedupKey2}`);
+        this._log("debug", `Deduplicating request: ${dedupKey}`);
         return pending;
       }
     }
     this._emit(events.REQUEST_START, () => ({ method: upperMethod, url: formattedUrl, config }));
-    const dedupKey = isGet && !config.stream ? `${upperMethod}:${formattedUrl}` : null;
     const requestPromise = this._executeRequest(upperMethod, formattedUrl, data, config, startTime, routeKey, urlObj);
     if (dedupKey && config.deduplicate !== false) {
       this.pendingRequests.set(dedupKey, requestPromise);
@@ -1496,7 +1544,7 @@ var HTTPClient = class _HTTPClient {
           this.metrics.redirects++;
           const location = response.headers.location;
           this.events.emit(events.REDIRECT, { from: url, to: location });
-          const redirectUrl = location.startsWith("http") ? location : new URL(location, url).href;
+          const redirectUrl = location.includes("://") ? location : new URL(location, url).href;
           if (response.data && typeof response.data.destroy === "function") {
             response.data.destroy();
           }
@@ -3502,6 +3550,27 @@ function tokenizeXML(xml) {
       i = end2 + 2;
       continue;
     }
+    if (xml[lt + 1] === "!") {
+      let depth = 0;
+      let quote = null;
+      let j = lt + 2;
+      for (; j < n; j++) {
+        const ch = xml[j];
+        if (quote) {
+          if (ch === quote) quote = null;
+        } else if (ch === '"' || ch === "'") {
+          quote = ch;
+        } else if (ch === "[") {
+          depth++;
+        } else if (ch === "]") {
+          if (depth > 0) depth--;
+        } else if (ch === ">" && depth === 0) {
+          break;
+        }
+      }
+      i = j + 1;
+      continue;
+    }
     if (xml[lt + 1] === "/") {
       const end2 = xml.indexOf(">", lt);
       if (end2 === -1) break;
@@ -3746,8 +3815,15 @@ function parseCSV(text, options = {}) {
   const headers = rows[0].map((h) => h.trim());
   return rows.slice(1).map((r) => {
     const obj = {};
+    const seen = /* @__PURE__ */ new Set();
     headers.forEach((h, i) => {
-      obj[h] = r[i] ?? null;
+      const value = r[i] ?? null;
+      if (seen.has(h)) {
+        obj[h] = Array.isArray(obj[h]) ? [...obj[h], value] : [obj[h], value];
+      } else {
+        seen.add(h);
+        obj[h] = value;
+      }
     });
     return obj;
   });

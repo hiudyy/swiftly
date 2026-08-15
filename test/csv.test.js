@@ -48,6 +48,15 @@ describe('csv.parseCSV', () => {
         expect(parseCSV('hello')).toEqual([]);
         expect(parseCSV('hello', { header: false })).toEqual([['hello']]);
     });
+    it('collects duplicate header columns into an array (no data loss)', () => {
+        expect(parseCSV('a,a,b\n1,2,3')).toEqual([{ a: ['1', '2'], b: '3' }]);
+    });
+    it('collects three occurrences of a duplicated header', () => {
+        expect(parseCSV('a,a,a\n1,2,3')).toEqual([{ a: ['1', '2', '3'] }]);
+    });
+    it('keeps single-occurrence columns as scalars', () => {
+        expect(parseCSV('a,b,b\n1,2,3')).toEqual([{ a: '1', b: ['2', '3'] }]);
+    });
 });
 
 describe('csv.toCSV', () => {

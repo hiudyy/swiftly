@@ -184,7 +184,7 @@ See [Cookies and sessions](../guides/cookies-and-sessions.md).
 | `stream` | `false` | Return a Readable instead of a buffered body. |
 | `signal` | — | `AbortSignal` for cancellation. |
 | `formData` | — | Encode `data` as `multipart/form-data`. |
-| `deduplicate` | `true` | Deduplicate concurrent GETs to the same URL. Set `false` to disable. |
+| `deduplicate` | `true` | Deduplicate concurrent GETs to the same URL. Keys are **auth-aware** (requests with different credentials are never merged). Set `false` to disable. |
 | `trackRouteTimes` | `false` | Record per-route metrics. |
 
 ### Behavior & hooks

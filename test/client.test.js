@@ -87,6 +87,13 @@ describe('client query params, baseURL and headers', () => {
         const body = await mk({ baseURL: srv.url }).get('/json');
         expect(body.ok).toBe(true);
     });
+    it('treats a path starting with "http" (no scheme) as relative under baseURL', async () => {
+        const c = mk({ baseURL: srv.url });
+        // Before the fix this failed with "Invalid URL" because the path
+        // looked like an absolute URL; now it resolves against baseURL and
+        // reaches the server (404 here, not a URL parsing error).
+        await expect(c.get('httpProxy/data')).rejects.toThrow('HTTP Error 404');
+    });
     it('sends custom headers', async () => {
         const body = await mk().get(`${srv.url}/headers`, { headers: { 'X-Test': 'yes' } });
         expect(body.headers['x-test']).toBe('yes');
@@ -222,6 +229,23 @@ describe('client circuit breaker', () => {
         const state = c.getMetrics().circuitBreakers.find(x => x.domain === '127.0.0.1');
         expect(state.state.state).toBe('OPEN');
         await expect(c.get(`${srv.url}/json`)).rejects.toBeInstanceOf(CircuitBreakerError);
+    });
+    it('allows only a single probe request in HALF-OPEN', async () => {
+        const c = mk({ retries: 1, retryDelay: 1, circuitBreaker: { enabled: true, failureThreshold: 1, resetTimeout: 1 } });
+        await expect(c.get(DEAD)).rejects.toThrow();
+        await new Promise((r) => setTimeout(r, 5));
+        // deduplicate: false so each request actually reaches the breaker
+        // (identical GETs would otherwise share a single deduped promise).
+        const results = await Promise.allSettled(Array.from({ length: 6 }, () => c.get(`${srv.url}/json`, { deduplicate: false })));
+        const ok = results.filter(r => r.status === 'fulfilled');
+        const rejected = results.filter(r => r.status === 'rejected');
+        // Exactly one trial passes; the concurrent burst fails fast.
+        expect(ok.length).toBe(1);
+        expect(ok[0].value.ok).toBe(true);
+        expect(rejected.length).toBe(5);
+        for (const r of rejected) {
+            expect(r.reason).toBeInstanceOf(CircuitBreakerError);
+        }
     });
 });
 
@@ -445,6 +469,17 @@ describe('client deduplication', () => {
             c.get(`${srv.url}/json`)
         ]);
         expect(a).toEqual(b);
+    });
+    it('does not merge concurrent GETs with different credentials', async () => {
+        const c = mk();
+        const [a, b] = await Promise.all([
+            c.get(`${srv.url}/headers`, { bearer: 'AAA' }),
+            c.get(`${srv.url}/headers`, { bearer: 'BBB' })
+        ]);
+        // Each caller must get its own authenticated response (dedup key
+        // varies by auth), never the other user's.
+        expect(a.headers.authorization).toBe('Bearer AAA');
+        expect(b.headers.authorization).toBe('Bearer BBB');
     });
 });
 

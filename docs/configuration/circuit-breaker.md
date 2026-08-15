@@ -21,7 +21,7 @@ const api = swiftly({
 |-------|---------|
 | `CLOSED` | Normal operation; requests flow through. |
 | `OPEN` | After `failureThreshold` consecutive failures. Requests are **rejected immediately** with `CircuitBreakerError` — no network call. |
-| `HALF-OPEN` | After `resetTimeout`, a single probe request is allowed. Success → back to CLOSED. Failure → back to OPEN. |
+| `HALF-OPEN` | After `resetTimeout`, a **single probe request** is allowed. Success → back to CLOSED. Failure → back to OPEN. While the probe is in flight, other requests are rejected immediately (fail fast) so a burst can't all hit a still-recovering service. |
 
 Each **hostname/domain** gets its own breaker.
 

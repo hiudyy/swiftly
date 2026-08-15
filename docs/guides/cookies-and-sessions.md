@@ -18,10 +18,13 @@ The jar honors the cookie spec:
 
 - **Domain** — host-only cookies match only their exact host; `Domain=`
   cookies also match any subdomain.
-- **Path** — a cookie is sent only when the request path starts with the
-  cookie's path.
+- **Path** — RFC 6265 path matching: a cookie is sent only when the request
+  path matches the cookie's path (a `Path=/api` cookie is *not* sent to
+  `/apikey`); paths that don't start with `/` fall back to `/`.
 - **Secure** — `Secure` cookies are only sent over `https:`.
 - **Expiry** — expired cookies are purged automatically when reading.
+  `Max-Age` is honored (relative seconds) and takes precedence over
+  `Expires`; `Max-Age=0` deletes the cookie.
 - **HttpOnly / SameSite** — attributes are stored (SameSite defaults to `Lax`).
 
 ## Accessing the jar

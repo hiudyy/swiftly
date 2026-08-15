@@ -16,13 +16,7 @@ need them. Not part of the stable API — but documented for completeness.
 | `isValidUrl(string)` | `(string) => boolean` | `new URL()` parses without throwing. |
 | `deepMerge(target, source)` | `(object, object) => object` | Immutable deep merge (arrays replace). |
 | `parseUrl(url)` | `(string) => { protocol, hostname, port, pathname, search, hash, params } \| null` | Parsed URL plus `params` map; `null` if invalid. |
-| `formatBytes(bytes, decimals?)` | `(number, number) => string` | `'1.5 KB'`, SI base 1024. |
-| `formatDuration(ms)` | `(number) => string` | `'42ms'` / `'1.20s'` / `'2.00m'`. |
-| `generateId()` | `() => string` | Base-36 timestamp + random suffix. |
-| `retryWithBackoff(fn, maxRetries?, baseDelay?)` | `(fn, number, number) => Promise` | Retries `fn()` with exponential backoff. |
-| `withTimeout(promise, ms, message?)` | `(Promise, number, string) => Promise` | Race with a timeout rejection. |
 | `safeJsonParse(str, fallback?)` | `(string, any) => any` | `JSON.parse` with a fallback on failure. |
-| `chunk(array, size)` | `(Array, number) => Array<Array>` | Split into arrays of at most `size`. |
 
 ## lib/agent.js — connection pooling
 
