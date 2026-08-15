@@ -7,6 +7,21 @@
 import { createClient } from './lib/client.js';
 import { parseHTML } from './lib/scraper.js';
 import { events } from './lib/events.js';
+import {
+    extractLinks,
+    extractImages,
+    extractText,
+    extractMeta,
+    extractTables,
+    extractForms,
+    extractJsonLd,
+    extractJSON,
+    sanitizeHtml,
+    htmlToMarkdown
+} from './lib/extract.js';
+import { parseXML, parseXMLTree, xmlToString, parseRSS, parseAtom, parseSitemap } from './lib/xml.js';
+import { parseCSV, toCSV } from './lib/csv.js';
+import { queryJSON } from './lib/jsonpath.js';
 
 // Shared default client so static calls reuse the connection pool,
 // cookie jar and cache instead of spinning up a new client each time.
@@ -48,6 +63,8 @@ const swiftly = (config = {}) => {
         return client.get(url, { ...config, responseType: 'text', cache: { enabled: false } })
             .then(response => parseHTML(response, selector, config));
     };
+
+    instance.parse = (html, selectors, config = {}) => parseHTML(html, selectors, config);
 
     instance.batch = (requests) => client.batch(requests);
     instance.download = (url, config) => client.download(url, config);
@@ -93,5 +110,49 @@ swiftly.client = getDefaultClient;
 // Export event constants
 swiftly.events = events;
 
+// Parsing & extraction utilities
+swiftly.parseHTML = parseHTML;
+swiftly.parseXML = parseXML;
+swiftly.parseXMLTree = parseXMLTree;
+swiftly.xmlToString = xmlToString;
+swiftly.parseRSS = parseRSS;
+swiftly.parseAtom = parseAtom;
+swiftly.parseSitemap = parseSitemap;
+swiftly.parseCSV = parseCSV;
+swiftly.toCSV = toCSV;
+swiftly.queryJSON = queryJSON;
+swiftly.extractLinks = extractLinks;
+swiftly.extractImages = extractImages;
+swiftly.extractText = extractText;
+swiftly.extractMeta = extractMeta;
+swiftly.extractTables = extractTables;
+swiftly.extractForms = extractForms;
+swiftly.extractJsonLd = extractJsonLd;
+swiftly.extractJSON = extractJSON;
+swiftly.sanitizeHtml = sanitizeHtml;
+swiftly.htmlToMarkdown = htmlToMarkdown;
+
 export default swiftly;
-export { events, parseHTML };
+export {
+    events,
+    parseHTML,
+    parseXML,
+    parseXMLTree,
+    xmlToString,
+    parseRSS,
+    parseAtom,
+    parseSitemap,
+    parseCSV,
+    toCSV,
+    queryJSON,
+    extractLinks,
+    extractImages,
+    extractText,
+    extractMeta,
+    extractTables,
+    extractForms,
+    extractJsonLd,
+    extractJSON,
+    sanitizeHtml,
+    htmlToMarkdown
+};

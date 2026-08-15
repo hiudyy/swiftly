@@ -5,7 +5,9 @@ const common = {
     platform: 'node',
     target: 'node14',
     sourcemap: true,
-    logLevel: 'info'
+    logLevel: 'info',
+    // undici is an optional runtime transport — never bundle it.
+    external: ['undici']
 };
 
 // CommonJS bundle (used by `require('swiftly')`)

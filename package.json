@@ -1,6 +1,6 @@
 {
   "name": "swiftly",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "The fastest, lightest HTTP client for Node.js. Zero dependencies.",
   "type": "module",
   "main": "index.cjs",
@@ -34,6 +34,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "check": "node -c index.mjs && node -c lib/*.js && node -c bin/swiftly.js && echo 'Syntax check passed'",
     "bench": "node benchmarks/bench.js",
+    "bench:deep": "SWIFTLY_BENCH_DEEP=1 SWIFTLY_BENCH_1M=1 node benchmarks/bench.js",
+    "bench:quick": "SWIFTLY_BENCH_ISOLATE=0 SWIFTLY_BENCH_N=200 SWIFTLY_BENCH_C=10 SWIFTLY_BENCH_ROUNDS=2 SWIFTLY_BENCH_WARMUP=10 node benchmarks/bench.js",
     "prepublishOnly": "npm run build",
     "start": "node index.mjs",
     "cli": "node bin/swiftly.js"
@@ -54,6 +56,15 @@
     "scraper",
     "web-scraping",
     "html-parser",
+    "html",
+    "xml",
+    "rss",
+    "atom",
+    "sitemap",
+    "csv",
+    "jsonpath",
+    "extractor",
+    "web-extraction",
     "circuit-breaker",
     "rate-limiter",
     "cache",
@@ -90,12 +101,28 @@
   "bugs": {
     "url": "https://github.com/cognima/swiftly/issues"
   },
+  "peerDependencies": {
+    "undici": ">=6"
+  },
+  "peerDependenciesMeta": {
+    "undici": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "axios": "^1.19.0",
+    "cacheable-request": "^13.0.19",
+    "cheerio": "^1.2.0",
     "esbuild": "^0.24.2",
     "got": "^15.1.0",
+    "http-cache-semantics": "^4.2.0",
+    "ky": "^2.0.2",
+    "lru-cache": "^11.5.2",
+    "node-fetch": "^3.3.2",
+    "superagent": "^10.3.0",
     "typescript": "^7.0.2",
+    "undici": "^8.10.0",
     "vitest": "^4.1.10"
   }
 }

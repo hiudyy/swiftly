@@ -78,6 +78,13 @@ export async function startServer() {
     return {
         port,
         url: `http://127.0.0.1:${port}`,
-        close: () => new Promise((resolve) => server.close(resolve))
+        close: () => new Promise((resolve) => {
+            // Destroy keep-alive sockets so server.close() doesn't hang on
+            // pooled connections held by the client under test.
+            if (typeof server.closeAllConnections === 'function') {
+                server.closeAllConnections();
+            }
+            server.close(resolve);
+        })
     };
 }
