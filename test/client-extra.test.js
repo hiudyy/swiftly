@@ -205,6 +205,13 @@ describe('client methods and payloads', () => {
         const body = await c.get(`${srv.url}/json`, { params: { q: '1' } });
         expect(body.query.q).toBe('1');
     });
+    it('preserves nested object/array query params (no [object Object])', async () => {
+        const c = mk();
+        const body = await c.get(`${srv.url}/json`, { params: { o: { x: 1 }, tags: ['a', 'b'] } });
+        expect(body.query.o).toBe('{"x":1}');
+        expect(body.query.tags).toBeDefined();
+        expect(JSON.stringify(body.query.tags)).not.toContain('[object Object]');
+    });
 });
 
 describe('client validation', () => {
