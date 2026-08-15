@@ -8,6 +8,9 @@ import { createClient } from '../lib/client.js';
 
 let server;
 let base;
+// Clients keep HTTP/2 sessions open; close() them before the server shuts
+// down, otherwise server.close() waits forever for the sessions to end.
+const clients = [];
 
 beforeAll(async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'swiftly-h2-'));
@@ -25,17 +28,31 @@ beforeAll(async () => {
     base = `https://127.0.0.1:${port}`;
 });
 
-afterAll(() => new Promise((r) => server.close(r)));
+afterAll(async () => {
+    for (const c of clients) {
+        try { await c.close(); } catch { /* already closed */ }
+    }
+    if (server) {
+        await new Promise((r) => {
+            if (typeof server.closeAllConnections === 'function') {
+                server.closeAllConnections();
+            }
+            server.close(r);
+        });
+    }
+});
 
 describe('client http2 transport', () => {
     it('performs a request over HTTP/2 honoring validateSSL:false', async () => {
         const c = createClient({ debug: false, cache: { enabled: false }, validateSSL: false, useHttp2: true });
+        clients.push(c);
         const body = await c.get(`${base}/json`);
         expect(body.ok).toBe(true);
         expect(c.getMetrics().http2Requests).toBeGreaterThanOrEqual(1);
     });
     it('reports the HTTP/2 session in metrics', async () => {
         const c = createClient({ debug: false, cache: { enabled: false }, validateSSL: false, useHttp2: true });
+        clients.push(c);
         await c.get(`${base}/json`);
         expect(c.getMetrics().http2Sessions).toBeGreaterThanOrEqual(1);
     });
