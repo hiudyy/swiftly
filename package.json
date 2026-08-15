@@ -115,7 +115,7 @@
     "axios": "^1.19.0",
     "cacheable-request": "^13.0.19",
     "cheerio": "^1.2.0",
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.28.2",
     "got": "^15.1.0",
     "http-cache-semantics": "^4.2.0",
     "ky": "^2.0.2",
